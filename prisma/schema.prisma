@@ -1,0 +1,206 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum LessonDay {
+  MONDAY
+  TUESDAY
+  WEDNESDAY
+  THURSDAY
+  FRIDAY
+  SATURDAY
+  SUNDAY
+  CUSTOM
+}
+
+enum VocabularyKind {
+  WORD
+  PHRASE
+  PHRASAL_VERB
+  COLLOCATION
+  IDIOM
+}
+
+enum LearningState {
+  NEW
+  LEARNING
+  REVIEWING
+  RELEARNING
+  MATURE
+  MASTERED
+}
+
+enum ExerciseType {
+  FLASHCARD
+  RECOGNITION
+  REVERSE_RECALL
+  CLOZE
+  SPELLING
+  LISTENING
+  DICTATION
+  USAGE
+}
+
+model Week {
+  id        String   @id @default(cuid())
+  number    Int
+  title     String?
+  startDate DateTime?
+  lessons   Lesson[]
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([number])
+}
+
+model Lesson {
+  id        String     @id @default(cuid())
+  weekId    String
+  week      Week       @relation(fields: [weekId], references: [id], onDelete: Cascade)
+  day       LessonDay
+  dayLabel  String?
+  title     String?
+  position  Int        @default(0)
+  vocabulary Vocabulary[]
+  reading   Reading?
+  createdAt DateTime   @default(now())
+  updatedAt DateTime   @updatedAt
+
+  @@unique([weekId, day, position])
+  @@index([weekId])
+}
+
+model Vocabulary {
+  id            String         @id @default(cuid())
+  lessonId      String?
+  lesson        Lesson?        @relation(fields: [lessonId], references: [id], onDelete: SetNull)
+
+  kind          VocabularyKind @default(WORD)
+  word          String
+  normalized    String
+  ipa           String?
+  partOfSpeech  String?
+  meaning       String
+  example       String?
+  note          String?
+  importance    Int            @default(1)
+
+  memory        MemoryState?
+  skill         SkillState?
+  reviews       ReviewLog[]
+
+  insight       VocabularyInsight?
+
+  createdAt     DateTime       @default(now())
+  updatedAt     DateTime       @updatedAt
+
+  @@index([normalized])
+  @@index([lessonId])
+}
+
+model VocabularyInsight {
+  id           String     @id @default(cuid())
+  vocabularyId String     @unique
+  vocabulary   Vocabulary @relation(fields: [vocabularyId], references: [id], onDelete: Cascade)
+
+  collocations Json
+  chunks       Json
+  confusions   Json
+
+  generatedAt  DateTime   @default(now())
+  updatedAt    DateTime   @updatedAt
+}
+
+model Reading {
+  id          String   @id @default(cuid())
+  lessonId    String   @unique
+  lesson      Lesson   @relation(fields: [lessonId], references: [id], onDelete: Cascade)
+
+  title       String
+  content     String   @db.Text
+  translation String?  @db.Text
+
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+}
+
+model MemoryState {
+  id              String        @id @default(cuid())
+  vocabularyId    String        @unique
+  vocabulary      Vocabulary    @relation(fields: [vocabularyId], references: [id], onDelete: Cascade)
+  state           LearningState @default(NEW)
+  due             DateTime      @default(now())
+  stability       Float         @default(0)
+  difficulty      Float         @default(0)
+  elapsedDays     Int           @default(0)
+  scheduledDays   Int           @default(0)
+  reps            Int           @default(0)
+  lapses          Int           @default(0)
+  learningSteps   Int           @default(0)
+  lastReview      DateTime?
+  totalReviews    Int           @default(0)
+  correctReviews  Int           @default(0)
+  wrongReviews    Int           @default(0)
+  createdAt       DateTime      @default(now())
+  updatedAt       DateTime      @updatedAt
+
+  @@index([due])
+}
+
+model SkillState {
+  id            String     @id @default(cuid())
+  vocabularyId  String     @unique
+  vocabulary    Vocabulary @relation(fields: [vocabularyId], references: [id], onDelete: Cascade)
+  recognition   Float      @default(0)
+  meaningRecall Float      @default(0)
+  spelling      Float      @default(0)
+  listening     Float      @default(0)
+  usage         Float      @default(0)
+  updatedAt     DateTime   @updatedAt
+}
+
+model ReviewLog {
+  id            String       @id @default(cuid())
+  vocabularyId  String
+  vocabulary    Vocabulary   @relation(fields: [vocabularyId], references: [id], onDelete: Cascade)
+  exerciseType  ExerciseType
+  rating        Int?
+  answer        String?
+  correct       Boolean
+  responseTime  Int?
+  hintsUsed     Int          @default(0)
+  reviewedAt    DateTime     @default(now())
+
+  @@index([vocabularyId, reviewedAt])
+}
+model DailySession {
+  id                      String       @id @default(cuid())
+  dateKey                 String       @unique
+  day                     LessonDay
+  weekNumber              Int?
+  startedAt               DateTime     @default(now())
+
+  dueTargets              Json
+  relearningTargets       Json
+  newTargets              Json
+  weakTargets             Json
+  readingTargets          Json
+  completedReadingTargets Json
+
+  workloadMode            WorkloadMode @default(NORMAL)
+  workloadMeta            Json?
+
+  createdAt               DateTime     @default(now())
+  updatedAt               DateTime     @updatedAt
+}
+
+enum WorkloadMode {
+  NORMAL
+  BUSY
+  RECOVERY
+}

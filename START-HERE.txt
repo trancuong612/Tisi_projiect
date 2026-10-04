@@ -1,0 +1,13 @@
+BRIGHT ENGLISH - START HERE
+
+1) Install Node.js 20+ and PostgreSQL.
+2) Create a PostgreSQL database named bright_english.
+3) Copy .env.example => .env
+4) Edit DATABASE_URL in .env
+5) Run:
+   npm install
+   npx prisma migrate dev --name init
+   npm run dev
+6) Open http://localhost:5173
+
+Import words: http://localhost:5173/admin/import
