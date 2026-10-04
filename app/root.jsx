@@ -14,22 +14,24 @@ import { useEffect, useState } from "react";
 import stylesheet from "./styles/tailwind.css?url";
 
 import BottomNav from "./components/BottomNav";
-import { requireUser } from "./utils/auth.server";
+
 export const links = () => [
   {
     rel: "stylesheet",
     href: stylesheet,
   },
-
   {
     rel: "manifest",
     href: "/manifest.webmanifest",
   },
-
   {
     rel: "icon",
     href: "/tisi.png",
     type: "image/png",
+  },
+  {
+    rel: "apple-touch-icon",
+    href: "/tisi.png",
   },
 ];
 
@@ -37,37 +39,30 @@ export const meta = () => [
   {
     title: "Tisi",
   },
-
   {
     name: "description",
     content: "Personal adaptive English learning system",
   },
-
   {
     name: "theme-color",
-    content: "#62b77b",
+    content: "#39794e",
   },
-
   {
     name: "viewport",
     content: "width=device-width, initial-scale=1, viewport-fit=cover",
   },
-
   {
     name: "mobile-web-app-capable",
     content: "yes",
   },
-
   {
     name: "apple-mobile-web-app-capable",
     content: "yes",
   },
-
   {
     name: "apple-mobile-web-app-status-bar-style",
     content: "default",
   },
-
   {
     name: "apple-mobile-web-app-title",
     content: "Tisi",
@@ -79,11 +74,6 @@ export default function App() {
 
   const loading = navigation.state !== "idle";
 
-  /**
-   * Service Worker chỉ register
-   * ở production để tránh cache
-   * gây khó chịu khi dev.
-   */
   useEffect(() => {
     if (!import.meta.env.PROD || !("serviceWorker" in navigator)) {
       return;
@@ -121,16 +111,12 @@ function Document({ children }) {
         {children}
 
         <ScrollRestoration />
-
         <Scripts />
       </body>
     </html>
   );
 }
 
-/**
- * NETWORK FEEDBACK
- */
 function OfflineBanner() {
   const [online, setOnline] = useState(true);
 
@@ -164,30 +150,20 @@ function OfflineBanner() {
   );
 }
 
-/**
- * GLOBAL ERROR BOUNDARY
- */
 export function ErrorBoundary() {
   const error = useRouteError();
 
   let status = 500;
-
   let title = "Có lỗi xảy ra";
-
-  let message = "Bright English gặp một lỗi ngoài dự kiến.";
+  let message = "Tisi gặp một lỗi ngoài dự kiến.";
 
   if (isRouteErrorResponse(error)) {
     status = error.status;
 
-    if (error.status === 404) {
+    if (status === 404) {
       title = "Không tìm thấy trang";
-
       message = "Trang bạn đang mở không tồn tại hoặc đã được di chuyển.";
-    } else if (error.status === 403) {
-      title = "Không có quyền truy cập";
-
-      message = "Bạn không có quyền thực hiện thao tác này.";
-    } else if (error.status === 400) {
+    } else if (status === 400) {
       title = "Yêu cầu không hợp lệ";
 
       message =
@@ -200,15 +176,8 @@ export function ErrorBoundary() {
           ? error.data
           : error.statusText || message;
     }
-  } else if (error instanceof Error) {
-    /**
-     * Không hiện stack trace
-     * hay thông tin kỹ thuật
-     * cho người dùng.
-     */
-    if (import.meta.env.DEV) {
-      message = error.message;
-    }
+  } else if (error instanceof Error && import.meta.env.DEV) {
+    message = error.message;
   }
 
   return (
