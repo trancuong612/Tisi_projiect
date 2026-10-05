@@ -103,6 +103,7 @@ function Document({ children }) {
   return (
     <html lang="vi">
       <head>
+        <meta charSet="utf-8" />
         <Meta />
         <Links />
       </head>
@@ -128,12 +129,10 @@ function OfflineBanner() {
     updateStatus();
 
     window.addEventListener("online", updateStatus);
-
     window.addEventListener("offline", updateStatus);
 
     return () => {
       window.removeEventListener("online", updateStatus);
-
       window.removeEventListener("offline", updateStatus);
     };
   }, []);

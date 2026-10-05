@@ -43,6 +43,8 @@ enum ExerciseType {
   SPELLING
   LISTENING
   DICTATION
+  COLLOCATION
+  CONFUSION
   USAGE
 }
 
@@ -93,6 +95,7 @@ model Vocabulary {
   memory        MemoryState?
   skill         SkillState?
   reviews       ReviewLog[]
+  newLearningProgress NewLearningProgress[]
 
   insight       VocabularyInsight?
 
@@ -197,6 +200,42 @@ model DailySession {
 
   createdAt               DateTime     @default(now())
   updatedAt               DateTime     @updatedAt
+  newLearningProgress     NewLearningProgress[]
+}
+
+model NewLearningProgress {
+  id                 String       @id @default(cuid())
+  sessionId          String
+  session            DailySession @relation(fields: [sessionId], references: [id], onDelete: Cascade)
+  vocabularyId       String
+  vocabulary         Vocabulary   @relation(fields: [vocabularyId], references: [id], onDelete: Cascade)
+
+  exposed            Boolean      @default(false)
+  recognitionPass    Boolean      @default(false)
+  recallPass         Boolean      @default(false)
+  spellingPass       Boolean      @default(false)
+  listeningPass      Boolean      @default(false)
+  dictationPass      Boolean      @default(false)
+  contextPass        Boolean      @default(false)
+  collocationPass    Boolean      @default(false)
+  confusionPass      Boolean      @default(false)
+  usagePass          Boolean      @default(false)
+  finalPass          Boolean      @default(false)
+
+  encounterCount     Int          @default(0)
+  correctCount       Int          @default(0)
+  wrongCount         Int          @default(0)
+  nextEligibleTurn   Int          @default(0)
+  lastTurn           Int          @default(-1)
+  lastExercise       ExerciseType?
+  masteredAt         DateTime?
+
+  createdAt          DateTime     @default(now())
+  updatedAt          DateTime     @updatedAt
+
+  @@unique([sessionId, vocabularyId])
+  @@index([sessionId, masteredAt, nextEligibleTurn])
+  @@index([vocabularyId])
 }
 
 enum WorkloadMode {
