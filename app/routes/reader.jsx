@@ -467,6 +467,7 @@ export default function Reader() {
                 reading={reading}
                 questions={questions}
                 questionIndex={questionIndex}
+                preview={preview}
               />
             )}
             {/* TEST */}
@@ -475,6 +476,7 @@ export default function Reader() {
                 reading={reading}
                 questions={questions}
                 questionIndex={questionIndex}
+                preview={preview}
               />
             )}
             {/* COMPLETE READING */}
@@ -788,6 +790,7 @@ function ListeningMode({ reading, questions, questionIndex, preview }) {
           readingId={reading.id}
           questionIndex={questionIndex}
           isLast={isLast}
+          preview={preview}
         />
       )}
     </article>
@@ -1051,7 +1054,7 @@ function ListeningFeedback({
     </div>
   );
 }
-function UsageMode({ reading, questions, questionIndex }) {
+function UsageMode({ reading, questions, questionIndex, preview }) {
   const actionData = useActionData();
 
   if (!questions.length) {
@@ -1140,6 +1143,7 @@ function UsageMode({ reading, questions, questionIndex }) {
           readingId={reading.id}
           questionIndex={questionIndex}
           isLast={isLast}
+          preview={preview}
         />
       )}
     </article>
@@ -1207,7 +1211,13 @@ function UsageAIForm({ question, apiError }) {
     </Form>
   );
 }
-function UsageAIFeedback({ result, readingId, questionIndex, isLast }) {
+function UsageAIFeedback({
+  result,
+  readingId,
+  questionIndex,
+  isLast,
+  preview,
+}) {
   const evaluation = result.evaluation;
 
   const verdict = evaluation.verdict;
@@ -1288,7 +1298,7 @@ function UsageAIFeedback({ result, readingId, questionIndex, isLast }) {
 
       {isLast ? (
         <Link
-          to={`/reader?readingId=${readingId}&mode=use&q=${questionIndex + 1}${
+          to={`/reader?readingId=${readingId}&mode=test${
             preview ? "&preview=1" : ""
           }`}
           className="mt-5 flex items-center justify-center gap-2 rounded-2xl bg-slate-900 px-5 py-4 font-black text-white">
@@ -1322,7 +1332,7 @@ function UsageCheck({ label, ok }) {
 /**
  * TEST MODE
  */
-function TestMode({ reading, questions, questionIndex }) {
+function TestMode({ reading, questions, questionIndex, preview }) {
   const actionData = useActionData();
 
   if (!questions.length) {
@@ -1378,6 +1388,7 @@ function TestMode({ reading, questions, questionIndex }) {
           readingId={reading.id}
           questionIndex={questionIndex}
           isLast={isLast}
+          preview={preview}
         />
       )}
     </article>
@@ -1465,7 +1476,14 @@ function TestForm({ question }) {
   );
 }
 
-function TestFeedback({ result, question, readingId, questionIndex, isLast }) {
+function TestFeedback({
+  result,
+  question,
+  readingId,
+  questionIndex,
+  isLast,
+  preview,
+}) {
   return (
     <div className="mt-6">
       <div
