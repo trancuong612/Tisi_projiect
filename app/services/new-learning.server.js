@@ -167,10 +167,6 @@ function buildCollocationTask(word) {
     ...jsonArray(word.insight?.chunks),
   ].filter((item) => item && typeof item.phrase === "string");
 
-  const targetTokens = new Set(
-    normalizeText(word.word).split(" ").map(normalizeToken).filter(Boolean),
-  );
-
   for (const item of lexicalItems) {
     const phrase = String(item.phrase || "").trim();
 
@@ -178,33 +174,35 @@ function buildCollocationTask(word) {
       continue;
     }
 
-    const phraseTokens = phrase.split(/\s+/);
+    /**
+     * Trong giai đoạn học từ mới, mục tiêu chính phải là
+     * tự nhớ lại TARGET WORD.
+     *
+     * Ví dụ:
+     * target = allocate
+     * phrase = allocate resources
+     *
+     * ĐÚNG:
+     * ______ resources
+     * answer = allocate
+     *
+     * KHÔNG dùng:
+     * allocate ______
+     * answer = resources
+     */
+    const targetCloze = createNewLearningCloze(phrase, word.word);
 
-    const candidateIndexes = phraseTokens
-      .map((token, index) => ({
-        token,
-        clean: normalizeToken(token),
-        index,
-      }))
-      .filter(
-        ({ clean }) =>
-          clean.length >= 3 &&
-          !targetTokens.has(clean) &&
-          !["the", "a", "an", "to", "of", "for", "in", "on"].includes(clean),
-      );
-
-    const selected = candidateIndexes.at(-1);
-
-    if (!selected) {
+    /**
+     * Nếu phrase không thực sự chứa target word,
+     * không dùng phrase đó làm bài collocation.
+     */
+    if (!targetCloze) {
       continue;
     }
 
-    const promptTokens = [...phraseTokens];
-    promptTokens[selected.index] = "________";
-
     return {
-      prompt: promptTokens.join(" "),
-      expectedAnswer: selected.clean,
+      prompt: targetCloze.prompt,
+      expectedAnswer: targetCloze.expectedAnswer,
       fullPhrase: phrase,
       meaning: String(item.meaning || "").trim(),
       example: String(item.example || "").trim(),
@@ -229,30 +227,81 @@ function buildConfusionTask(word) {
   }
 
   const targetExample = String(confusion.targetExample || "").trim();
-  const cloze = createNewLearningCloze(targetExample, word.word);
+  const otherExample = String(confusion.otherExample || "").trim();
 
-  if (cloze) {
+  /**
+   * Tìm đúng dạng surface form xuất hiện trong câu.
+   *
+   * Ví dụ:
+   * word.word = "learn"
+   * targetExample = "He learns English every day."
+   *
+   * expectedAnswer phải là "learns",
+   * không phải "learn".
+   */
+  const targetCloze = createNewLearningCloze(targetExample, word.word);
+
+  /**
+   * Nếu từ gây nhiễu cũng có example,
+   * lấy luôn đúng dạng biến đổi của nó.
+   *
+   * Ví dụ:
+   * confusion.word = "study"
+   * otherExample = "He studies English every day."
+   *
+   * option sẽ là "studies",
+   * thay vì chỉ có "study".
+   */
+  const confusionCloze = createNewLearningCloze(otherExample, confusion.word);
+
+  if (targetCloze) {
+    const correctOption = targetCloze.expectedAnswer;
+
+    const confusionOption = confusionCloze?.expectedAnswer || confusion.word;
+
+    const options = uniqueBy([correctOption, confusionOption], (value) =>
+      normalizeText(value),
+    );
+
     return {
-      prompt: cloze.prompt,
-      expectedAnswer: cloze.expectedAnswer,
-      options: shuffle([word.word, confusion.word]),
+      prompt: targetCloze.prompt,
+
+      /**
+       * Quan trọng:
+       * expectedAnswer và option đúng PHẢI giống nhau.
+       */
+      expectedAnswer: correctOption,
+
+      options: shuffle(options),
+
       confusionWord: confusion.word,
       confusionMeaning: String(confusion.meaning || "").trim(),
       difference: String(confusion.difference || "").trim(),
+
       targetExample,
-      otherExample: String(confusion.otherExample || "").trim(),
+      otherExample,
     };
   }
 
+  /**
+   * Nếu không tạo được cloze từ example,
+   * fallback về dạng base word.
+   */
   return {
     prompt: `Bạn muốn diễn đạt nghĩa “${word.meaning}”. Chọn từ phù hợp nhất.`,
+
     expectedAnswer: word.word,
-    options: shuffle([word.word, confusion.word]),
+
+    options: shuffle(
+      uniqueBy([word.word, confusion.word], (value) => normalizeText(value)),
+    ),
+
     confusionWord: confusion.word,
     confusionMeaning: String(confusion.meaning || "").trim(),
     difference: String(confusion.difference || "").trim(),
+
     targetExample,
-    otherExample: String(confusion.otherExample || "").trim(),
+    otherExample,
   };
 }
 
