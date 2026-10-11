@@ -181,6 +181,17 @@ export async function getDailyLearningQueue() {
       state: {
         not: "NEW",
       },
+
+      /**
+       * Từ mới của curriculum hôm nay
+       * chưa được phép xuất hiện trong Review.
+       *
+       * Chúng phải hoàn thành New Learning Engine
+       * trước, sau đó mới được FSRS tiếp quản.
+       */
+      vocabularyId: {
+        notIn: newWordIds,
+      },
     },
 
     include: {

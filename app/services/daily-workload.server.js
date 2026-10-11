@@ -1,14 +1,13 @@
 const DAY_MS = 24 * 60 * 60 * 1000;
 
 /**
- * Đây là workload safety limits,
- * KHÔNG phải mục tiêu cố định số từ/ngày.
+ * Workload safety limits.
  *
  * NORMAL:
- * không giới hạn curriculum.
+ * curriculum quyết định khối lượng.
  *
  * BUSY / RECOVERY:
- * chỉ giới hạn tạm thời khi backlog cao.
+ * giới hạn tạm thời khi backlog cao.
  */
 const CONFIG = {
   busyDueThreshold: 40,
@@ -49,9 +48,7 @@ function getDuePriority(memory, now) {
   );
 
   const difficulty = clamp(memory.difficulty || 0, 0, 10);
-
   const lapses = memory.lapses || 0;
-
   const importance = memory.vocabulary?.importance || 1;
 
   let stateBoost = 0;
@@ -62,10 +59,6 @@ function getDuePriority(memory, now) {
     stateBoost = 2;
   }
 
-  /**
-   * Đây là priority tương đối,
-   * không phải điểm kiến thức.
-   */
   return (
     overdueDays * 1.2 + lapses * 2 + difficulty * 0.5 + importance + stateBoost
   );
@@ -97,6 +90,57 @@ function takeIds(items, limit) {
     .map((item) => (typeof item === "string" ? item : item.id));
 }
 
+function uniqueIds(values) {
+  return [...new Set(values.filter(Boolean))];
+}
+
+/**
+ * Bảo hiểm cuối:
+ *
+ * Một vocabularyId chỉ được xuất hiện
+ * trong MỘT bucket duy nhất.
+ *
+ * Priority:
+ *
+ * RELEARNING
+ * ↓
+ * DUE
+ * ↓
+ * WEAK
+ * ↓
+ * NEW
+ */
+function enforceUniqueTargets(targets) {
+  const used = new Set();
+
+  function takeUnique(values) {
+    const result = [];
+
+    for (const id of uniqueIds(values)) {
+      if (used.has(id)) {
+        continue;
+      }
+
+      used.add(id);
+      result.push(id);
+    }
+
+    return result;
+  }
+
+  const relearning = takeUnique(targets.relearning || []);
+  const due = takeUnique(targets.due || []);
+  const weak = takeUnique(targets.weak || []);
+  const newWords = takeUnique(targets.newWords || []);
+
+  return {
+    due,
+    relearning,
+    weak,
+    newWords,
+  };
+}
+
 export function buildDailyWorkload({
   now,
   dueMemories,
@@ -106,33 +150,74 @@ export function buildDailyWorkload({
 }) {
   const daysSinceLastActivity = calculateDaysSince(lastActivityAt, now);
 
+  /**
+   * 1. RELEARNING có priority cao nhất.
+   */
   const relearningWords = weakWords.filter(
     (word) => word.weakProfile.status === "RELEARNING",
-  );
-
-  const weakOnlyWords = weakWords.filter(
-    (word) => word.weakProfile.status === "WEAK",
   );
 
   const relearningIds = new Set(relearningWords.map((word) => word.id));
 
   /**
-   * Không double count:
-   * từ RELEARNING đi vào
-   * bucket riêng.
+   * 2. DUE.
+   *
+   * Một từ đã thuộc RELEARNING
+   * thì không được xuất hiện thêm trong DUE.
    */
   const rankedDue = dueMemories
     .filter((memory) => !relearningIds.has(memory.vocabularyId))
     .map((memory) => ({
       ...memory,
-
       priority: getDuePriority(memory, now),
     }))
     .sort((a, b) => b.priority - a.priority);
 
+  /**
+   * Toàn bộ raw DUE IDs.
+   *
+   * Quan trọng:
+   * dùng RAW set, không phải chỉ những từ
+   * sau khi cap Busy/Recovery.
+   *
+   * Nếu một từ DUE bị deferred,
+   * nó cũng không được lẻn sang WEAK.
+   */
+  const dueIds = new Set(rankedDue.map((memory) => memory.vocabularyId));
+
+  /**
+   * 3. WEAK.
+   *
+   * Chỉ là WEAK thuần túy.
+   *
+   * Nếu đã thuộc:
+   * - RELEARNING
+   * - DUE
+   *
+   * thì loại khỏi bucket WEAK.
+   */
+  const weakOnlyWords = weakWords.filter(
+    (word) =>
+      word.weakProfile.status === "WEAK" &&
+      !relearningIds.has(word.id) &&
+      !dueIds.has(word.id),
+  );
+
+  const weakIds = new Set(weakOnlyWords.map((word) => word.id));
+
+  /**
+   * 4. NEW.
+   *
+   * Bình thường NEW không thể trùng DUE,
+   * nhưng vẫn phòng thủ dữ liệu để
+   * một ID chỉ có đúng một nhiệm vụ.
+   */
+  const cleanedNewWordIds = uniqueIds(newWordIds).filter(
+    (id) => !relearningIds.has(id) && !dueIds.has(id) && !weakIds.has(id),
+  );
+
   const mode = chooseMode({
     dueCount: rankedDue.length,
-
     daysSinceLastActivity,
   });
 
@@ -140,71 +225,62 @@ export function buildDailyWorkload({
 
   if (mode === "RECOVERY") {
     targets = {
-      due: takeIds(rankedDue, CONFIG.recoveryDueCap),
-
       relearning: takeIds(relearningWords, CONFIG.recoveryRelearningCap),
+
+      due: takeIds(rankedDue, CONFIG.recoveryDueCap),
 
       weak: takeIds(weakOnlyWords, CONFIG.recoveryWeakCap),
 
-      /**
-       * Recovery:
-       * tạm ngừng nạp kiến thức mới.
-       */
       newWords: [],
     };
   } else if (mode === "BUSY") {
     targets = {
-      due: takeIds(rankedDue, CONFIG.busyDueCap),
-
       relearning: takeIds(relearningWords, CONFIG.busyRelearningCap),
+
+      due: takeIds(rankedDue, CONFIG.busyDueCap),
 
       weak: takeIds(weakOnlyWords, CONFIG.busyWeakCap),
 
-      /**
-       * Busy:
-       * giảm lượng new words,
-       * không tắt hoàn toàn.
-       */
-      newWords: newWordIds.slice(
+      newWords: cleanedNewWordIds.slice(
         0,
-        Math.ceil(newWordIds.length * CONFIG.busyNewRatio),
+        Math.ceil(cleanedNewWordIds.length * CONFIG.busyNewRatio),
       ),
     };
   } else {
-    /**
-     * NORMAL:
-     *
-     * Không ép số từ/ngày.
-     * Curriculum của bạn quyết định.
-     */
     targets = {
-      due: rankedDue.map((memory) => memory.vocabularyId),
-
       relearning: relearningWords.map((word) => word.id),
+
+      due: rankedDue.map((memory) => memory.vocabularyId),
 
       weak: weakOnlyWords.map((word) => word.id),
 
-      newWords: [...newWordIds],
+      newWords: [...cleanedNewWordIds],
     };
   }
 
+  /**
+   * Safety net cuối cùng.
+   *
+   * Dù dữ liệu đầu vào có bất thường,
+   * targets trả về vẫn tuyệt đối không trùng ID.
+   */
+  targets = enforceUniqueTargets(targets);
+
+  /**
+   * RAW cũng phải phản ánh số nhiệm vụ
+   * thực sự khác nhau.
+   */
   const raw = {
     due: rankedDue.length,
-
     relearning: relearningWords.length,
-
     weak: weakOnlyWords.length,
-
-    newWords: newWordIds.length,
+    newWords: cleanedNewWordIds.length,
   };
 
   const selected = {
     due: targets.due.length,
-
     relearning: targets.relearning.length,
-
     weak: targets.weak.length,
-
     newWords: targets.newWords.length,
   };
 
@@ -250,9 +326,7 @@ export function buildDailyWorkload({
 
   return {
     mode,
-
     reason,
-
     daysSinceLastActivity,
 
     raw,

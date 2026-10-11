@@ -7,7 +7,60 @@ function toArray(value) {
 }
 
 function unique(values) {
-  return [...new Set(values)];
+  return [...new Set((values || []).filter(Boolean))];
+}
+
+/**
+ * Một vocabulary chỉ được xuất hiện
+ * trong MỘT bucket của Daily Session.
+ *
+ * Priority:
+ * RELEARNING
+ * ↓
+ * DUE
+ * ↓
+ * WEAK
+ * ↓
+ * NEW
+ */
+function sanitizeSessionTargets({
+  due = [],
+  relearning = [],
+  weak = [],
+  newWords = [],
+}) {
+  const used = new Set();
+
+  function takeUnique(values) {
+    const result = [];
+
+    for (const id of unique(values)) {
+      if (used.has(id)) {
+        continue;
+      }
+
+      used.add(id);
+      result.push(id);
+    }
+
+    return result;
+  }
+
+  const cleanRelearning = takeUnique(relearning);
+  const cleanDue = takeUnique(due);
+  const cleanWeak = takeUnique(weak);
+  const cleanNew = takeUnique(newWords);
+
+  return {
+    due: cleanDue,
+    relearning: cleanRelearning,
+    weak: cleanWeak,
+    newWords: cleanNew,
+  };
+}
+
+function arraysEqual(a, b) {
+  return JSON.stringify(a) === JSON.stringify(b);
 }
 
 export async function getOrCreateDailySession({
@@ -25,12 +78,39 @@ export async function getOrCreateDailySession({
     },
   });
 
+  const cleanIncoming = sanitizeSessionTargets({
+    due: toArray(targets?.due),
+    relearning: toArray(targets?.relearning),
+    weak: toArray(targets?.weak),
+    newWords: toArray(targets?.newWords),
+  });
+
   if (existing) {
     /**
-     * Upgrade session cũ được tạo
-     * trước Phase 3E.
-     *
-     * Chỉ chạy 1 lần nếu chưa có metadata.
+     * Repair DailySession được tạo bởi
+     * phiên bản cũ nếu target bị duplicate.
+     */
+    const oldDue = toArray(existing.dueTargets);
+    const oldRelearning = toArray(existing.relearningTargets);
+    const oldWeak = toArray(existing.weakTargets);
+    const oldNew = toArray(existing.newTargets);
+
+    const cleanedExisting = sanitizeSessionTargets({
+      due: oldDue,
+      relearning: oldRelearning,
+      weak: oldWeak,
+      newWords: oldNew,
+    });
+
+    const targetsChanged =
+      !arraysEqual(oldDue, cleanedExisting.due) ||
+      !arraysEqual(oldRelearning, cleanedExisting.relearning) ||
+      !arraysEqual(oldWeak, cleanedExisting.weak) ||
+      !arraysEqual(oldNew, cleanedExisting.newWords);
+
+    /**
+     * Session cũ chưa có metadata:
+     * nâng cấp bằng workload hiện tại.
      */
     if (!existing.workloadMeta) {
       return prisma.dailySession.update({
@@ -42,42 +122,61 @@ export async function getOrCreateDailySession({
           workloadMode,
           workloadMeta,
 
-          dueTargets: unique(targets.due),
-
-          relearningTargets: unique(targets.relearning),
-
-          newTargets: unique(targets.newWords),
-
-          weakTargets: unique(targets.weak),
+          dueTargets: cleanIncoming.due,
+          relearningTargets: cleanIncoming.relearning,
+          weakTargets: cleanIncoming.weak,
+          newTargets: cleanIncoming.newWords,
 
           readingTargets: unique(readings),
+
+          /**
+           * Không reset completedReadingTargets.
+           */
         },
       });
     }
 
     /**
-     * Session đã được chốt.
-     * Không merge thêm target.
+     * Session hôm nay đã tồn tại.
+     * Chỉ repair duplicate.
+     *
+     * Không rebuild toàn bộ snapshot,
+     * không reset tiến độ đã học.
      */
+    if (targetsChanged) {
+      return prisma.dailySession.update({
+        where: {
+          id: existing.id,
+        },
+
+        data: {
+          dueTargets: cleanedExisting.due,
+          relearningTargets: cleanedExisting.relearning,
+          weakTargets: cleanedExisting.weak,
+          newTargets: cleanedExisting.newWords,
+        },
+      });
+    }
+
     return existing;
   }
 
+  /**
+   * Session mới luôn được tạo
+   * bằng target đã sanitize.
+   */
   return prisma.dailySession.create({
     data: {
       dateKey,
       day,
       weekNumber,
 
-      dueTargets: unique(targets.due),
-
-      relearningTargets: unique(targets.relearning),
-
-      newTargets: unique(targets.newWords),
-
-      weakTargets: unique(targets.weak),
+      dueTargets: cleanIncoming.due,
+      relearningTargets: cleanIncoming.relearning,
+      weakTargets: cleanIncoming.weak,
+      newTargets: cleanIncoming.newWords,
 
       readingTargets: unique(readings),
-
       completedReadingTargets: [],
 
       workloadMode,
@@ -87,13 +186,18 @@ export async function getOrCreateDailySession({
 }
 
 function buildStep({ key, total, completed }) {
-  const safeCompleted = Math.min(total, completed);
+  const safeTotal = Math.max(0, Number(total || 0));
+
+  const safeCompleted = Math.min(
+    safeTotal,
+    Math.max(0, Number(completed || 0)),
+  );
 
   let status = "PENDING";
 
-  if (total === 0) {
+  if (safeTotal === 0) {
     status = "NOT_REQUIRED";
-  } else if (safeCompleted >= total) {
+  } else if (safeCompleted >= safeTotal) {
     status = "DONE";
   } else if (safeCompleted > 0) {
     status = "IN_PROGRESS";
@@ -101,11 +205,11 @@ function buildStep({ key, total, completed }) {
 
   return {
     key,
-    total,
 
+    total: safeTotal,
     completed: safeCompleted,
 
-    remaining: Math.max(0, total - safeCompleted),
+    remaining: Math.max(0, safeTotal - safeCompleted),
 
     status,
   };
@@ -113,26 +217,54 @@ function buildStep({ key, total, completed }) {
 
 export async function getDailySessionProgress(session) {
   const dueIds = toArray(session.dueTargets);
-
   const relearningIds = toArray(session.relearningTargets);
-
   const newIds = toArray(session.newTargets);
-
   const weakIds = toArray(session.weakTargets);
 
   const readingIds = toArray(session.readingTargets);
 
   const completedReadingIds = toArray(session.completedReadingTargets);
 
+  const now = new Date();
+
   /**
-   * Due chỉ hoàn thành khi
-   * có FLASHCARD correct.
+   * =====================================================
+   * DUE
+   * =====================================================
    *
-   * Rating Again sẽ chưa complete.
+   * Snapshot có thể chứa một từ từng DUE,
+   * nhưng hiện tại FSRS đã chuyển due sang tương lai.
+   *
+   * Nếu cứ giữ từ đó trong denominator,
+   * Daily Session sẽ bị kẹt:
+   *
+   * Home: 0/30
+   * Review: không có câu nào.
+   *
+   * Vì vậy:
+   *
+   * - đã review trong session → tính completed
+   * - chưa review và due <= now → vẫn actionable
+   * - chưa review nhưng due > now → không khóa session
+   * - MemoryState không còn tồn tại → không khóa session
    */
-  const completedDue = dueIds.length
-    ? (
-        await prisma.reviewLog.findMany({
+
+  const [dueMemories, dueReviews] = dueIds.length
+    ? await Promise.all([
+        prisma.memoryState.findMany({
+          where: {
+            vocabularyId: {
+              in: dueIds,
+            },
+          },
+
+          select: {
+            vocabularyId: true,
+            due: true,
+          },
+        }),
+
+        prisma.reviewLog.findMany({
           where: {
             vocabularyId: {
               in: dueIds,
@@ -141,10 +273,6 @@ export async function getDailySessionProgress(session) {
             reviewedAt: {
               gte: session.startedAt,
             },
-
-            exerciseType: "FLASHCARD",
-
-            correct: true,
           },
 
           select: {
@@ -152,33 +280,100 @@ export async function getDailySessionProgress(session) {
           },
 
           distinct: ["vocabularyId"],
-        })
-      ).length
-    : 0;
+        }),
+      ])
+    : [[], []];
 
-  const completedRelearning = relearningIds.length
-    ? (
-        await prisma.reviewLog.findMany({
-          where: {
-            vocabularyId: {
-              in: relearningIds,
-            },
+  const dueMemoryMap = new Map(
+    dueMemories.map((memory) => [memory.vocabularyId, memory]),
+  );
 
-            reviewedAt: {
-              gte: session.startedAt,
-            },
+  const reviewedDueIds = new Set(
+    dueReviews.map((review) => review.vocabularyId),
+  );
 
-            correct: true,
+  /**
+   * Chỉ giữ những DUE hiện thực sự
+   * có ý nghĩa đối với Daily Session.
+   */
+  const effectiveDueIds = dueIds.filter((id) => {
+    /**
+     * Đã thực hiện retrieval trong session.
+     * Giữ lại để tính completed.
+     */
+    if (reviewedDueIds.has(id)) {
+      return true;
+    }
+
+    const memory = dueMemoryMap.get(id);
+
+    /**
+     * Vocabulary/MemoryState không còn.
+     * Không được khóa Daily Session.
+     */
+    if (!memory) {
+      return false;
+    }
+
+    /**
+     * Hiện vẫn thực sự đến hạn.
+     */
+    return new Date(memory.due) <= now;
+  });
+
+  const completedDue = effectiveDueIds.filter((id) =>
+    reviewedDueIds.has(id),
+  ).length;
+
+  /**
+   * =====================================================
+   * RELEARNING
+   * =====================================================
+   *
+   * Daily Session đo workload đã thực hiện,
+   * không phải mastery.
+   *
+   * Một từ đã được retrieval hôm nay
+   * thì nhiệm vụ Relearning của ngày đó
+   * đã được thực hiện.
+   *
+   * Nếu sai, FSRS / Weak Engine vẫn chịu trách nhiệm
+   * đưa nó quay lại sau.
+   */
+
+  const relearningReviews = relearningIds.length
+    ? await prisma.reviewLog.findMany({
+        where: {
+          vocabularyId: {
+            in: relearningIds,
           },
 
-          select: {
-            vocabularyId: true,
+          reviewedAt: {
+            gte: session.startedAt,
           },
+        },
 
-          distinct: ["vocabularyId"],
-        })
-      ).length
-    : 0;
+        select: {
+          vocabularyId: true,
+        },
+
+        distinct: ["vocabularyId"],
+      })
+    : [];
+
+  const completedRelearning = relearningReviews.length;
+
+  /**
+   * =====================================================
+   * NEW
+   * =====================================================
+   *
+   * New Word Learning Engine chỉ chuyển:
+   *
+   * NEW → LEARNING
+   *
+   * sau khi từ đã vượt acquisition/mastery gate.
+   */
 
   const completedNew = newIds.length
     ? await prisma.memoryState.count({
@@ -194,38 +389,64 @@ export async function getDailySessionProgress(session) {
       })
     : 0;
 
-  const completedWeak = weakIds.length
-    ? (
-        await prisma.reviewLog.findMany({
-          where: {
-            vocabularyId: {
-              in: weakIds,
-            },
+  /**
+   * =====================================================
+   * WEAK
+   * =====================================================
+   *
+   * Giống Relearning:
+   * Daily Session chỉ yêu cầu
+   * đã thực hiện retrieval/practice hôm nay.
+   */
 
-            reviewedAt: {
-              gte: session.startedAt,
-            },
-
-            correct: true,
+  const weakReviews = weakIds.length
+    ? await prisma.reviewLog.findMany({
+        where: {
+          vocabularyId: {
+            in: weakIds,
           },
 
-          select: {
-            vocabularyId: true,
+          reviewedAt: {
+            gte: session.startedAt,
           },
+        },
 
-          distinct: ["vocabularyId"],
-        })
-      ).length
-    : 0;
+        select: {
+          vocabularyId: true,
+        },
+
+        distinct: ["vocabularyId"],
+      })
+    : [];
+
+  const completedWeak = weakReviews.length;
+
+  /**
+   * =====================================================
+   * READING
+   * =====================================================
+   */
 
   const completedReading = readingIds.filter((id) =>
     completedReadingIds.includes(id),
   ).length;
 
+  /**
+   * =====================================================
+   * STEPS
+   * =====================================================
+   */
+
   const steps = [
     buildStep({
       key: "DUE",
-      total: dueIds.length,
+
+      /**
+       * QUAN TRỌNG:
+       * không dùng dueIds.length nữa.
+       */
+      total: effectiveDueIds.length,
+
       completed: completedDue,
     }),
 
@@ -279,8 +500,19 @@ export async function getDailySessionProgress(session) {
 }
 
 /**
- * Review Queue chỉ được lấy
- * từ target đã được Daily Session chọn.
+ * =====================================================
+ * REVIEW QUEUE
+ * =====================================================
+ *
+ * Nguyên tắc:
+ *
+ * Nếu progress nói còn một DUE actionable,
+ * function này PHẢI tìm được từ tương ứng.
+ *
+ * Nhờ vậy không còn trạng thái:
+ *
+ * Home: còn DUE
+ * /review: không có bài.
  */
 export async function getNextSessionReviewWord(sessionId) {
   const session = await prisma.dailySession.findUnique({
@@ -310,15 +542,15 @@ export async function getNextSessionReviewWord(sessionId) {
       memory: true,
       skill: true,
 
+      /**
+       * Bất kỳ retrieval nào trong session
+       * đều coi target DUE này đã được xử lý.
+       */
       reviews: {
         where: {
           reviewedAt: {
             gte: session.startedAt,
           },
-
-          exerciseType: "FLASHCARD",
-
-          correct: true,
         },
 
         select: {
@@ -336,27 +568,35 @@ export async function getNextSessionReviewWord(sessionId) {
 
   /**
    * Giữ đúng thứ tự priority
-   * được Workload Engine chốt.
+   * do Workload Engine chốt.
    */
   for (const id of dueIds) {
     const word = map.get(id);
 
+    /**
+     * Target stale hoặc vocabulary
+     * đã bị xóa.
+     */
     if (!word || !word.memory) {
       continue;
     }
 
     /**
-     * Đã có một review đúng hôm nay.
+     * Đã retrieval trong Daily Session này.
+     * Không hỏi lại trong bucket DUE.
      */
     if (word.reviews.length > 0) {
       continue;
     }
 
     /**
-     * Nếu vừa Again,
-     * FSRS có thể đặt due vài phút tới.
+     * FSRS đã đẩy sang tương lai.
      *
-     * Không hỏi lại ngay.
+     * Không actionable ở thời điểm này
+     * nên không hỏi.
+     *
+     * getDailySessionProgress()
+     * cũng loại target này khỏi denominator.
      */
     if (new Date(word.memory.due) > now) {
       continue;
@@ -367,15 +607,20 @@ export async function getNextSessionReviewWord(sessionId) {
 
   return null;
 }
+
 /**
- * Lấy từ NEW tiếp theo đúng theo
- * snapshot DailySession hôm nay.
+ * =====================================================
+ * NEW WORD QUEUE
+ * =====================================================
+ *
+ * Giữ đúng snapshot DailySession.
  */
 export async function getNextSessionNewWord(sessionId) {
   const session = await prisma.dailySession.findUnique({
     where: {
       id: sessionId,
     },
+
     select: {
       newTargets: true,
     },
@@ -413,8 +658,8 @@ export async function getNextSessionNewWord(sessionId) {
   const map = new Map(words.map((word) => [word.id, word]));
 
   /**
-   * Giữ đúng thứ tự
-   * Workload Engine đã chốt.
+   * Giữ đúng thứ tự do
+   * Workload Engine chốt.
    */
   for (const id of newIds) {
     const word = map.get(id);
@@ -425,7 +670,7 @@ export async function getNextSessionNewWord(sessionId) {
 
     /**
      * Chưa có MemoryState
-     * hoặc vẫn NEW
+     * hoặc state vẫn NEW
      * = chưa hoàn thành Learn.
      */
     if (!word.memory || word.memory.state === "NEW") {
@@ -437,17 +682,21 @@ export async function getNextSessionNewWord(sessionId) {
 }
 
 /**
- * Xác nhận người học đã
- * làm quen một từ mới.
+ * =====================================================
+ * LEGACY NEW-WORD ACTIVATION
+ * =====================================================
  *
- * Đây KHÔNG phải review,
- * nên không tạo ReviewLog.
+ * Giữ lại để tương thích với các route cũ.
+ *
+ * Đây không phải Review.
+ * Không tạo ReviewLog.
  */
 export async function activateSessionNewWord({ sessionId, vocabularyId }) {
   const session = await prisma.dailySession.findUnique({
     where: {
       id: sessionId,
     },
+
     select: {
       newTargets: true,
     },
@@ -462,9 +711,8 @@ export async function activateSessionNewWord({ sessionId, vocabularyId }) {
   const newIds = toArray(session.newTargets);
 
   /**
-   * Không cho route Learn
-   * kích hoạt từ ngoài
-   * DailySession hôm nay.
+   * Không cho route kích hoạt
+   * vocabulary ngoài DailySession.
    */
   if (!newIds.includes(vocabularyId)) {
     throw new Response("Vocabulary is not part of today's new-word session.", {
@@ -493,16 +741,16 @@ export async function activateSessionNewWord({ sessionId, vocabularyId }) {
     }
 
     /**
-     * Nếu đã chuyển khỏi NEW
-     * bởi một thao tác khác
-     * thì không hạ state lại.
+     * Nếu từ đã chuyển khỏi NEW
+     * bởi New Learning Engine hoặc
+     * thao tác khác thì không hạ state.
      */
     if (vocabulary.memory && vocabulary.memory.state !== "NEW") {
       return vocabulary;
     }
 
     /**
-     * MemoryState có thể chưa tồn tại.
+     * Đảm bảo MemoryState tồn tại.
      */
     if (vocabulary.memory) {
       await tx.memoryState.update({
@@ -514,13 +762,11 @@ export async function activateSessionNewWord({ sessionId, vocabularyId }) {
           state: "LEARNING",
 
           /**
-           * Chưa có review thực sự,
-           * nên chưa tính reps /
-           * correctReviews.
+           * Chưa tạo ReviewLog,
+           * chưa tăng reps.
            *
-           * Due=now giúp từ này
-           * đủ điều kiện được FSRS
-           * xử lý ở phiên sau.
+           * Due=now chỉ để từ đủ điều kiện
+           * được scheduler xử lý sau.
            */
           due: now,
         },
@@ -529,18 +775,14 @@ export async function activateSessionNewWord({ sessionId, vocabularyId }) {
       await tx.memoryState.create({
         data: {
           vocabularyId,
-
           state: "LEARNING",
-
           due: now,
         },
       });
     }
 
     /**
-     * Bảo đảm SkillState tồn tại
-     * để Review/Practice sau này
-     * không gặp update missing row.
+     * Bảo đảm SkillState tồn tại.
      */
     if (!vocabulary.skill) {
       await tx.skillState.create({
@@ -562,6 +804,12 @@ export async function activateSessionNewWord({ sessionId, vocabularyId }) {
     });
   });
 }
+
+/**
+ * =====================================================
+ * READING COMPLETION
+ * =====================================================
+ */
 export async function markReadingCompleted({ sessionId, readingId }) {
   const session = await prisma.dailySession.findUnique({
     where: {
@@ -575,6 +823,9 @@ export async function markReadingCompleted({ sessionId, readingId }) {
     });
   }
 
+  /**
+   * Không cho duplicate reading IDs.
+   */
   const completed = unique([
     ...toArray(session.completedReadingTargets),
 

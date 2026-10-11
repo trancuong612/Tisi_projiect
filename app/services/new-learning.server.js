@@ -167,51 +167,100 @@ function buildCollocationTask(word) {
     ...jsonArray(word.insight?.chunks),
   ].filter((item) => item && typeof item.phrase === "string");
 
+  /**
+   * COLLOCATION trong New Word Learning
+   * phải có NGỮ CẢNH CÂU ĐẦY ĐỦ.
+   *
+   * Không tạo bài kiểu:
+   *
+   *   ______ resources
+   *
+   * vì chỉ có 1 từ làm ngữ cảnh,
+   * quá ít để hiểu cách dùng.
+   *
+   * Ưu tiên:
+   *
+   * 1. Example riêng của collocation/chunk
+   * 2. Nếu không có thì thử example chính của vocabulary
+   * 3. Nếu vẫn không có câu hợp lệ thì bỏ checkpoint này
+   *
+   * Bài hợp lệ:
+   *
+   *   The company decided to ______ more resources to training.
+   *
+   * expectedAnswer = allocate
+   */
   for (const item of lexicalItems) {
     const phrase = String(item.phrase || "").trim();
+    const lexicalExample = String(item.example || "").trim();
 
     if (!phrase) {
       continue;
     }
 
     /**
-     * Trong giai đoạn học từ mới, mục tiêu chính phải là
-     * tự nhớ lại TARGET WORD.
-     *
-     * Ví dụ:
-     * target = allocate
-     * phrase = allocate resources
-     *
-     * ĐÚNG:
-     * ______ resources
-     * answer = allocate
-     *
-     * KHÔNG dùng:
-     * allocate ______
-     * answer = resources
+     * Ưu tiên example riêng của lexical item,
+     * vì nó thể hiện collocation chính xác hơn.
      */
-    const targetCloze = createNewLearningCloze(phrase, word.word);
+    const exampleCandidates = [
+      lexicalExample,
+      String(word.example || "").trim(),
+    ].filter(Boolean);
 
-    /**
-     * Nếu phrase không thực sự chứa target word,
-     * không dùng phrase đó làm bài collocation.
-     */
-    if (!targetCloze) {
-      continue;
+    for (const example of exampleCandidates) {
+      /**
+       * Không chấp nhận phrase quá ngắn làm prompt.
+       *
+       * Ta cần một câu có ít nhất khoảng 4 token
+       * để người học có đủ context.
+       */
+      const tokenCount = example.split(/\s+/).filter(Boolean).length;
+
+      if (tokenCount < 4) {
+        continue;
+      }
+
+      const cloze = createNewLearningCloze(example, word.word);
+
+      /**
+       * Example phải thực sự chứa target word
+       * hoặc dạng biến đổi của target word.
+       */
+      if (!cloze) {
+        continue;
+      }
+
+      return {
+        type: "CONTEXTUAL_COLLOCATION",
+
+        prompt: cloze.prompt,
+
+        expectedAnswer: cloze.expectedAnswer,
+
+        fullPhrase: phrase,
+
+        meaning: String(item.meaning || "").trim(),
+
+        example,
+
+        /**
+         * Có thể dùng ở UI như một gợi ý
+         * nếu sau này muốn hiển thị:
+         *
+         * Collocation: allocate resources
+         */
+        collocationHint: phrase,
+      };
     }
-
-    return {
-      prompt: targetCloze.prompt,
-      expectedAnswer: targetCloze.expectedAnswer,
-      fullPhrase: phrase,
-      meaning: String(item.meaning || "").trim(),
-      example: String(item.example || "").trim(),
-    };
   }
 
+  /**
+   * Không có full sentence đủ tốt
+   * thì KHÔNG bắt người học làm
+   * một bài collocation nghèo ngữ cảnh.
+   */
   return null;
 }
-
 function buildConfusionTask(word) {
   const confusions = jsonArray(word.insight?.confusions).filter(
     (item) =>
