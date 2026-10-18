@@ -1,5 +1,8 @@
 import { prisma } from "../utils/db.server";
-import { calculateWeakProfile } from "./weak-words.server";
+import {
+  calculateWeakProfile,
+  getAcquiredVocabularyIdSet,
+} from "./weak-words.server";
 import { getAdaptiveRecommendation } from "./adaptive-recommendation.server";
 const PRACTICE_SKILLS = ["meaningRecall", "spelling", "listening", "usage"];
 
@@ -312,61 +315,67 @@ function weightedPick(words) {
   return prepared[0].word;
 }
 
-export async function getAdaptiveExercise() {
+export async function getAdaptiveExercise({
+  mode = null,
+  sessionId = null,
+} = {}) {
+  const scoped = mode === "RELEARNING" || mode === "WEAK";
+  let pendingIds = null;
+
+  if (scoped) {
+    if (!sessionId) return null;
+    const session = await prisma.dailySession.findUnique({
+      where: { id: sessionId },
+      select: { startedAt: true, relearningTargets: true, weakTargets: true },
+    });
+    if (!session) return null;
+
+    const targets =
+      mode === "RELEARNING" ? session.relearningTargets : session.weakTargets;
+    const ids = [...new Set(Array.isArray(targets) ? targets : [])];
+    if (!ids.length) return null;
+
+    const completed = await prisma.reviewLog.findMany({
+      where: {
+        vocabularyId: { in: ids },
+        reviewedAt: { gte: session.startedAt },
+      },
+      select: { vocabularyId: true },
+      distinct: ["vocabularyId"],
+    });
+    const done = new Set(completed.map((row) => row.vocabularyId));
+    pendingIds = ids.filter((id) => !done.has(id));
+    if (!pendingIds.length) return null;
+  }
+
   const [words, recommendation] = await Promise.all([
     prisma.vocabulary.findMany({
+      where: scoped
+        ? { id: { in: pendingIds } }
+        : { memory: { is: { state: { not: "NEW" } } } },
       include: {
         skill: true,
         memory: true,
-
-        reviews: {
-          orderBy: {
-            reviewedAt: "desc",
-          },
-
-          take: 20,
-        },
+        reviews: { orderBy: { reviewedAt: "desc" }, take: 20 },
       },
-
-      orderBy: {
-        createdAt: "desc",
-      },
-
-      take: 150,
+      orderBy: { createdAt: "desc" },
+      ...(!scoped ? { take: 300 } : {}),
     }),
-
-    /**
-     * Phase 5C
-     *
-     * Chỉ query recommendation
-     * một lần cho request này.
-     */
     getAdaptiveRecommendation(),
   ]);
 
-  if (!words.length) {
-    return null;
-  }
+  // Dữ liệu từ New Learning có ReviewLog nhưng chưa qua Final
+  // phải bị chặn, kể cả đang lưu MemoryState = LEARNING.
+  const acquired = await getAcquiredVocabularyIdSet(words.map((w) => w.id));
+  const ready = words.filter((word) => acquired.has(word.id));
+  if (!ready.length) return null;
 
-  const ranked = words
-    .map((word) => ({
-      ...word,
-
-      _priority: calculatePriority(word),
-    }))
+  const ranked = ready
+    .map((word) => ({ ...word, _priority: calculatePriority(word) }))
     .sort((a, b) => b._priority - a._priority);
-
-  /**
-   * Random có trọng số trong
-   * nhóm ưu tiên cao.
-   */
   const candidatePool = ranked.slice(0, Math.min(15, ranked.length));
-
   const word = weightedPick(candidatePool);
-
-  if (!word) {
-    return null;
-  }
+  if (!word) return null;
 
   const selection = selectExercise(word, recommendation);
 
@@ -458,6 +467,8 @@ function updateSkillValue({ current, correct, quality, weight }) {
 }
 
 export async function gradeAdaptiveAnswer({
+  mode = null,
+  sessionId = null,
   vocabularyId,
   exerciseType,
   answer,
@@ -472,6 +483,7 @@ export async function gradeAdaptiveAnswer({
 
     include: {
       skill: true,
+      memory: true,
     },
   });
 
@@ -481,9 +493,69 @@ export async function gradeAdaptiveAnswer({
     });
   }
 
+  const acquired = await getAcquiredVocabularyIdSet([vocabularyId]);
+  if (!acquired.has(vocabularyId)) {
+    throw new Response("Từ này chưa hoàn thành New Learning Engine.", {
+      status: 409,
+    });
+  }
+
+  if (mode === "RELEARNING" || mode === "WEAK") {
+    if (!sessionId) {
+      throw new Response("Daily Session không hợp lệ.", { status: 400 });
+    }
+    const session = await prisma.dailySession.findUnique({
+      where: { id: sessionId },
+      select: { startedAt: true, relearningTargets: true, weakTargets: true },
+    });
+    if (!session)
+      throw new Response("Daily Session không tồn tại.", { status: 404 });
+    const targets =
+      mode === "RELEARNING" ? session.relearningTargets : session.weakTargets;
+    if (!Array.isArray(targets) || !targets.includes(vocabularyId)) {
+      throw new Response("Từ không thuộc nhóm bài tập đang học.", {
+        status: 409,
+      });
+    }
+    const alreadyDone = await prisma.reviewLog.findFirst({
+      where: {
+        vocabularyId,
+        reviewedAt: { gte: session.startedAt },
+      },
+      select: { id: true },
+    });
+    if (alreadyDone) {
+      throw new Response(
+        "Từ này đã làm trong nhóm hôm nay. Tải câu tiếp theo.",
+        {
+          status: 409,
+        },
+      );
+    }
+  }
+
+  if (!["REVERSE_RECALL", "CLOZE", "DICTATION"].includes(exerciseType)) {
+    throw new Response("Dạng bài không hợp lệ.", { status: 400 });
+  }
+  const cloze = createCloze(word.example, word.word);
+  if (exerciseType === "CLOZE" && !cloze) {
+    throw new Response("Từ này không có câu cloze hợp lệ.", { status: 409 });
+  }
+  // Không tin expectedAnswer từ browser: đáp án chuẩn nằm trên server.
+  const canonicalAnswer =
+    exerciseType === "CLOZE" ? cloze.expectedAnswer : word.word;
+  if (
+    expectedAnswer &&
+    normalizeText(expectedAnswer) !== normalizeText(canonicalAnswer)
+  ) {
+    throw new Response("Đáp án bài tập đã thay đổi, vui lòng tải lại.", {
+      status: 409,
+    });
+  }
+
   const normalizedAnswer = normalizeText(answer);
 
-  const normalizedExpected = normalizeText(expectedAnswer || word.word);
+  const normalizedExpected = normalizeText(canonicalAnswer);
 
   const correct = normalizedAnswer === normalizedExpected;
 
@@ -548,7 +620,7 @@ export async function gradeAdaptiveAnswer({
 
     quality: Number(quality.toFixed(2)),
 
-    correctAnswer: expectedAnswer || word.word,
+    correctAnswer: canonicalAnswer,
 
     word: word.word,
     meaning: word.meaning,

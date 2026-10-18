@@ -1,6 +1,6 @@
 import { prisma } from "../utils/db.server";
 
-import { getWeakWords } from "./weak-words.server";
+import { getWeakWords, getAcquiredVocabularyIdSet } from "./weak-words.server";
 
 import { buildDailyWorkload } from "./daily-workload.server";
 
@@ -149,10 +149,12 @@ export async function getDailyLearningQueue() {
   /**
    * Curriculum new words.
    */
-  const newWordIds = lessons.flatMap((lesson) =>
-    lesson.vocabulary
-      .filter((word) => !word.memory || word.memory.state === "NEW")
-      .map((word) => word.id),
+  const curriculumIds = lessons.flatMap((lesson) =>
+    lesson.vocabulary.map((word) => word.id),
+  );
+  const acquiredCurriculum = await getAcquiredVocabularyIdSet(curriculumIds);
+  const newWordIds = [...new Set(curriculumIds)].filter(
+    (id) => !acquiredCurriculum.has(id),
   );
 
   /**
@@ -172,7 +174,7 @@ export async function getDailyLearningQueue() {
   /**
    * Raw FSRS backlog.
    */
-  const dueMemories = await prisma.memoryState.findMany({
+  const rawDueMemories = await prisma.memoryState.findMany({
     where: {
       due: {
         lte: now,
@@ -203,6 +205,15 @@ export async function getDailyLearningQueue() {
       },
     },
   });
+
+  // Gate cuối: loại cả từ chưa học của hôm khác, và từ đã có
+  // ReviewLog trong lúc New Learning Engine nhưng chưa vượt Final.
+  const acquiredDue = await getAcquiredVocabularyIdSet(
+    rawDueMemories.map((memory) => memory.vocabularyId),
+  );
+  const dueMemories = rawDueMemories.filter((memory) =>
+    acquiredDue.has(memory.vocabularyId),
+  );
 
   /**
    * Activity gần nhất.
@@ -289,7 +300,7 @@ export async function getDailyLearningQueue() {
 
       description: "Những từ từng biết nhưng gần đây bắt đầu quên.",
 
-      path: "/practice",
+      path: "/practice?mode=relearning",
 
       priority: 2,
 
@@ -317,7 +328,7 @@ export async function getDailyLearningQueue() {
 
       description: "Adaptive Practice tập trung vào kỹ năng chưa vững.",
 
-      path: "/practice",
+      path: "/practice?mode=weak",
 
       priority: 4,
 
@@ -386,6 +397,34 @@ export async function getDailyLearningQueue() {
       ? session.workloadMeta
       : {};
 
+  // Tổng nhiệm vụ hiển thị phải dựa trên snapshot đã repair,
+  // không lấy "selected" của metadata cũ còn trùng target.
+  const sessionSelected = {
+    due: Array.isArray(session.dueTargets) ? session.dueTargets.length : 0,
+    relearning: Array.isArray(session.relearningTargets)
+      ? session.relearningTargets.length
+      : 0,
+    newWords: Array.isArray(session.newTargets) ? session.newTargets.length : 0,
+    weak: Array.isArray(session.weakTargets) ? session.weakTargets.length : 0,
+  };
+  sessionSelected.total = Object.values(sessionSelected).reduce(
+    (a, b) => a + b,
+    0,
+  );
+
+  const raw = savedMeta.raw || workload.raw;
+  const deferred = {
+    due: Math.max(0, Number(raw.due || 0) - sessionSelected.due),
+    relearning: Math.max(
+      0,
+      Number(raw.relearning || 0) - sessionSelected.relearning,
+    ),
+    weak: Math.max(0, Number(raw.weak || 0) - sessionSelected.weak),
+    newWords: Math.max(0, Number(raw.newWords || 0) - sessionSelected.newWords),
+  };
+  deferred.total =
+    deferred.due + deferred.relearning + deferred.weak + deferred.newWords;
+
   return {
     sessionId: session.id,
 
@@ -423,11 +462,11 @@ export async function getDailyLearningQueue() {
       daysSinceLastActivity:
         savedMeta.daysSinceLastActivity ?? workload.daysSinceLastActivity,
 
-      raw: savedMeta.raw || workload.raw,
+      raw,
 
-      selected: savedMeta.selected || workload.selected,
+      selected: sessionSelected,
 
-      deferred: savedMeta.deferred || workload.deferred,
+      deferred,
     },
 
     progress,

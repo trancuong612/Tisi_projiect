@@ -99,8 +99,16 @@ export function calculateWeakProfile(word) {
   const olderReviews = reviews.slice(2);
 
   const hadPreviousSuccess = olderReviews.some((review) => review.correct);
+  const hadFsrsSuccess = Number(word.memory?.correctReviews || 0) > 0;
 
-  if (reviews.length >= 4 && hadPreviousSuccess && recentFailures >= 0.5) {
+  // RELEARNING yêu cầu từ từng được nhớ đúng trong FSRS,
+  // không chỉ đúng ở bài kiểm tra trong lúc đang học từ mới.
+  if (
+    reviews.length >= 4 &&
+    hadPreviousSuccess &&
+    hadFsrsSuccess &&
+    recentFailures >= 0.5
+  ) {
     status = "RELEARNING";
   } else if (score >= 0.65) {
     status = "WEAK";
@@ -127,6 +135,53 @@ export function calculateWeakProfile(word) {
   };
 }
 
+/**
+ * Một từ chỉ đi vào các engine ôn tập SAU KHI hoàn thành học từ mới.
+ *
+ * Nếu từ đã từng vào New Learning Engine: cần Final Challenge thành công.
+ * Nếu là dữ liệu legacy không có NewLearningProgress: cần có FSRS review
+ * thực sự (memory.totalReviews > 0), không chỉ một MemoryState trống.
+ *
+ * Không dùng số lượng ReviewLog để xác định việc đã học: chính New
+ * Learning Engine cũng tạo ReviewLog trước khi vượt Final Challenge.
+ */
+export async function getAcquiredVocabularyIdSet(vocabularyIds = []) {
+  const ids = [...new Set(vocabularyIds.filter(Boolean))];
+  if (!ids.length) return new Set();
+
+  const [memories, progressRows] = await Promise.all([
+    prisma.memoryState.findMany({
+      where: { vocabularyId: { in: ids } },
+      select: { vocabularyId: true, state: true, totalReviews: true },
+    }),
+    prisma.newLearningProgress.findMany({
+      where: { vocabularyId: { in: ids } },
+      select: { vocabularyId: true, finalPass: true, masteredAt: true },
+    }),
+  ]);
+
+  const acquisition = new Map();
+  for (const progress of progressRows) {
+    const entry = acquisition.get(progress.vocabularyId) || {
+      existed: false,
+      completed: false,
+    };
+    entry.existed = true;
+    if (progress.finalPass && progress.masteredAt) entry.completed = true;
+    acquisition.set(progress.vocabularyId, entry);
+  }
+
+  const eligible = new Set();
+  for (const memory of memories) {
+    if (memory.state === "NEW") continue;
+    const progress = acquisition.get(memory.vocabularyId);
+    if (progress ? progress.completed : Number(memory.totalReviews || 0) > 0) {
+      eligible.add(memory.vocabularyId);
+    }
+  }
+  return eligible;
+}
+
 export async function getWeakWords({ limit = 50 } = {}) {
   const words = await prisma.vocabulary.findMany({
     include: {
@@ -147,7 +202,15 @@ export async function getWeakWords({ limit = 50 } = {}) {
     },
   });
 
+  const acquired = await getAcquiredVocabularyIdSet(
+    words.map((word) => word.id),
+  );
+
   return words
+    .filter(
+      (word) =>
+        acquired.has(word.id) && Number(word.memory?.totalReviews || 0) > 0,
+    )
     .map((word) => ({
       ...word,
 
@@ -166,6 +229,7 @@ export async function getWeakWordStats() {
   const words = await prisma.vocabulary.findMany({
     include: {
       skill: true,
+      memory: true,
 
       reviews: {
         orderBy: {
@@ -177,7 +241,18 @@ export async function getWeakWordStats() {
     },
   });
 
-  const profiles = words.map(calculateWeakProfile);
+  const acquired = await getAcquiredVocabularyIdSet(
+    words.map((word) => word.id),
+  );
+  const profiles = words.map((word) => {
+    if (!acquired.has(word.id)) {
+      return { status: "NEW" };
+    }
+    if (Number(word.memory?.totalReviews || 0) === 0) {
+      return { status: "LEARNING" };
+    }
+    return calculateWeakProfile(word);
+  });
 
   return {
     total: words.length,

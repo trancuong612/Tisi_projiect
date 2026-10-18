@@ -1,4 +1,5 @@
 import { prisma } from "../utils/db.server";
+import { getAcquiredVocabularyIdSet } from "./weak-words.server";
 
 function toArray(value) {
   return Array.isArray(value)
@@ -15,13 +16,13 @@ function unique(values) {
  * trong MỘT bucket của Daily Session.
  *
  * Priority:
+ * NEW (incomplete acquisition)
+ * ↓
  * RELEARNING
  * ↓
  * DUE
  * ↓
  * WEAK
- * ↓
- * NEW
  */
 function sanitizeSessionTargets({
   due = [],
@@ -46,10 +47,10 @@ function sanitizeSessionTargets({
     return result;
   }
 
+  const cleanNew = takeUnique(newWords);
   const cleanRelearning = takeUnique(relearning);
   const cleanDue = takeUnique(due);
   const cleanWeak = takeUnique(weak);
-  const cleanNew = takeUnique(newWords);
 
   return {
     due: cleanDue,
@@ -57,6 +58,26 @@ function sanitizeSessionTargets({
     weak: cleanWeak,
     newWords: cleanNew,
   };
+}
+
+/**
+ * Loại vocabulary chưa vượt qua Final Challenge ra khỏi các bucket ôn.
+ * Snapshot NEW được giữ lại để progress không biến mất khi người học hoàn thành.
+ */
+async function getSafeSessionTargets(targets) {
+  const newWords = unique(toArray(targets.newWords));
+  const reviewIds = unique([
+    ...toArray(targets.relearning),
+    ...toArray(targets.due),
+    ...toArray(targets.weak),
+  ]);
+  const acquired = await getAcquiredVocabularyIdSet(reviewIds);
+  return sanitizeSessionTargets({
+    newWords,
+    relearning: toArray(targets.relearning).filter((id) => acquired.has(id)),
+    due: toArray(targets.due).filter((id) => acquired.has(id)),
+    weak: toArray(targets.weak).filter((id) => acquired.has(id)),
+  });
 }
 
 function arraysEqual(a, b) {
@@ -78,7 +99,7 @@ export async function getOrCreateDailySession({
     },
   });
 
-  const cleanIncoming = sanitizeSessionTargets({
+  const cleanIncoming = await getSafeSessionTargets({
     due: toArray(targets?.due),
     relearning: toArray(targets?.relearning),
     weak: toArray(targets?.weak),
@@ -95,7 +116,7 @@ export async function getOrCreateDailySession({
     const oldWeak = toArray(existing.weakTargets);
     const oldNew = toArray(existing.newTargets);
 
-    const cleanedExisting = sanitizeSessionTargets({
+    const cleanedExisting = await getSafeSessionTargets({
       due: oldDue,
       relearning: oldRelearning,
       weak: oldWeak,
@@ -226,6 +247,14 @@ export async function getDailySessionProgress(session) {
   const completedReadingIds = toArray(session.completedReadingTargets);
 
   const now = new Date();
+  const acquired = await getAcquiredVocabularyIdSet([
+    ...dueIds,
+    ...relearningIds,
+    ...weakIds,
+    ...newIds,
+  ]);
+  const effectiveRelearningIds = relearningIds.filter((id) => acquired.has(id));
+  const effectiveWeakIds = weakIds.filter((id) => acquired.has(id));
 
   /**
    * =====================================================
@@ -297,6 +326,7 @@ export async function getDailySessionProgress(session) {
    * có ý nghĩa đối với Daily Session.
    */
   const effectiveDueIds = dueIds.filter((id) => {
+    if (!acquired.has(id)) return false;
     /**
      * Đã thực hiện retrieval trong session.
      * Giữ lại để tính completed.
@@ -341,11 +371,11 @@ export async function getDailySessionProgress(session) {
    * đưa nó quay lại sau.
    */
 
-  const relearningReviews = relearningIds.length
+  const relearningReviews = effectiveRelearningIds.length
     ? await prisma.reviewLog.findMany({
         where: {
           vocabularyId: {
-            in: relearningIds,
+            in: effectiveRelearningIds,
           },
 
           reviewedAt: {
@@ -375,19 +405,7 @@ export async function getDailySessionProgress(session) {
    * sau khi từ đã vượt acquisition/mastery gate.
    */
 
-  const completedNew = newIds.length
-    ? await prisma.memoryState.count({
-        where: {
-          vocabularyId: {
-            in: newIds,
-          },
-
-          state: {
-            not: "NEW",
-          },
-        },
-      })
-    : 0;
+  const completedNew = newIds.filter((id) => acquired.has(id)).length;
 
   /**
    * =====================================================
@@ -399,11 +417,11 @@ export async function getDailySessionProgress(session) {
    * đã thực hiện retrieval/practice hôm nay.
    */
 
-  const weakReviews = weakIds.length
+  const weakReviews = effectiveWeakIds.length
     ? await prisma.reviewLog.findMany({
         where: {
           vocabularyId: {
-            in: weakIds,
+            in: effectiveWeakIds,
           },
 
           reviewedAt: {
@@ -452,7 +470,7 @@ export async function getDailySessionProgress(session) {
 
     buildStep({
       key: "RELEARNING",
-      total: relearningIds.length,
+      total: effectiveRelearningIds.length,
       completed: completedRelearning,
     }),
 
@@ -464,7 +482,7 @@ export async function getDailySessionProgress(session) {
 
     buildStep({
       key: "WEAK",
-      total: weakIds.length,
+      total: effectiveWeakIds.length,
       completed: completedWeak,
     }),
 
@@ -565,6 +583,7 @@ export async function getNextSessionReviewWord(sessionId) {
   const map = new Map(words.map((word) => [word.id, word]));
 
   const now = new Date();
+  const acquired = await getAcquiredVocabularyIdSet(dueIds);
 
   /**
    * Giữ đúng thứ tự priority
@@ -577,7 +596,7 @@ export async function getNextSessionReviewWord(sessionId) {
      * Target stale hoặc vocabulary
      * đã bị xóa.
      */
-    if (!word || !word.memory) {
+    if (!word || !word.memory || !acquired.has(id)) {
       continue;
     }
 
@@ -656,6 +675,7 @@ export async function getNextSessionNewWord(sessionId) {
   });
 
   const map = new Map(words.map((word) => [word.id, word]));
+  const acquired = await getAcquiredVocabularyIdSet(newIds);
 
   /**
    * Giữ đúng thứ tự do
@@ -673,7 +693,7 @@ export async function getNextSessionNewWord(sessionId) {
      * hoặc state vẫn NEW
      * = chưa hoàn thành Learn.
      */
-    if (!word.memory || word.memory.state === "NEW") {
+    if (!acquired.has(id)) {
       return word;
     }
   }
@@ -718,6 +738,18 @@ export async function activateSessionNewWord({ sessionId, vocabularyId }) {
     throw new Response("Vocabulary is not part of today's new-word session.", {
       status: 400,
     });
+  }
+
+  // Chỉ cho kích hoạt FSRS sau Final Challenge, tránh đánh dấu
+  // LEARNING trước khi New Learning Engine hoàn tất.
+  const acquired = await getAcquiredVocabularyIdSet([vocabularyId]);
+  if (!acquired.has(vocabularyId)) {
+    throw new Response(
+      "Hãy hoàn thành Final Challenge trước khi kích hoạt FSRS.",
+      {
+        status: 409,
+      },
+    );
   }
 
   const now = new Date();

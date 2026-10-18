@@ -12,18 +12,22 @@ import { useEffect, useState } from "react";
 
 import DesktopHeader from "../components/DesktopHeader";
 import TtsButton from "../components/TtsButton";
+import { getDailyLearningQueue } from "../services/daily-learning.server";
 
 import {
   getAdaptiveExercise,
   gradeAdaptiveAnswer,
 } from "../services/adaptive-learning.server";
 
-export async function loader() {
-  const exercise = await getAdaptiveExercise();
+export async function loader({ request }) {
+  const url = new URL(request.url);
+  const requested = String(url.searchParams.get("mode") || "").toUpperCase();
+  const mode = ["RELEARNING", "WEAK"].includes(requested) ? requested : null;
+  const daily = mode ? await getDailyLearningQueue() : null;
+  const sessionId = daily?.sessionId || null;
+  const exercise = await getAdaptiveExercise({ mode, sessionId });
 
-  return json({
-    exercise,
-  });
+  return json({ exercise, mode, sessionId });
 }
 
 export async function action({ request }) {
@@ -40,8 +44,13 @@ export async function action({ request }) {
   const responseTime = Math.max(0, Number(form.get("responseTime") || 0));
 
   const hintsUsed = Math.max(0, Number(form.get("hintsUsed") || 0));
+  const modeValue = String(form.get("mode") || "").toUpperCase();
+  const mode = ["RELEARNING", "WEAK"].includes(modeValue) ? modeValue : null;
+  const sessionId = String(form.get("sessionId") || "") || null;
 
   const result = await gradeAdaptiveAnswer({
+    mode,
+    sessionId,
     vocabularyId,
     exerciseType,
     answer,
@@ -123,7 +132,8 @@ function buildHints(exercise) {
 }
 
 export default function Practice() {
-  const { exercise } = useLoaderData();
+  const { exercise, mode, sessionId } = useLoaderData();
+  const nextUrl = mode ? `/practice?mode=${mode.toLowerCase()}` : "/practice";
 
   const result = useActionData();
 
@@ -147,7 +157,12 @@ export default function Practice() {
 
         <main className="page-shell max-w-xl">
           <div className="soft-card rounded-3xl p-8 text-center">
-            Chưa có từ để luyện.
+            {mode
+              ? "Bạn đã xử lý hết từ trong nhóm này hôm nay, hoặc chưa có từ đủ điều kiện."
+              : "Chưa có từ đã học xong để luyện."}
+            <Link to="/" className="mt-5 block text-emerald-700 font-bold">
+              Về lộ trình →
+            </Link>
           </div>
         </main>
       </>
@@ -216,7 +231,7 @@ export default function Practice() {
             </div>
 
             <Link
-              to="/practice"
+              to={nextUrl}
               className="mt-6 block w-full rounded-2xl bg-emerald-600 px-5 py-4 font-black text-white">
               Câu tiếp theo →
             </Link>
@@ -231,7 +246,13 @@ export default function Practice() {
       <DesktopHeader />
 
       <main className="page-shell max-w-xl pb-28">
-        <p className="text-sm font-black text-emerald-700">ADAPTIVE PRACTICE</p>
+        <p className="text-sm font-black text-emerald-700">
+          {mode === "RELEARNING"
+            ? "TỪ CẦN HỌC LẠI"
+            : mode === "WEAK"
+            ? "CỦNG CỐ TỪ YẾU"
+            : "ADAPTIVE PRACTICE"}
+        </p>
 
         <h1 className="mt-1 text-2xl font-black">Gọi lại từ từ trí nhớ</h1>
 
@@ -256,6 +277,8 @@ export default function Practice() {
               input.value = String(elapsed);
             }
           }}>
+          <input type="hidden" name="mode" value={mode || ""} />
+          <input type="hidden" name="sessionId" value={sessionId || ""} />
           <input type="hidden" name="vocabularyId" value={exercise.id} />
 
           <input type="hidden" name="exerciseType" value={exercise.type} />
