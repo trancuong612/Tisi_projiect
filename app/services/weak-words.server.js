@@ -36,20 +36,25 @@ export function calculateWeakProfile(word) {
   const reviews = word.reviews || [];
 
   if (!reviews.length) {
+    const acquired = word.memory && word.memory.state !== "NEW";
+    const weakest = Math.min(...SKILLS.map((key) => skills[key]));
+    const needsPractice =
+      acquired && (mastery < 0.4 || (weakest < 0.35 && mastery < 0.65));
     return {
       mastery,
-
       weakness: 1 - mastery,
-
       wrongRate: 0,
       hintRate: 0,
       slowRate: 0,
       recentFailures: 0,
-
       score: 1 - mastery,
-
-      status: "NEW",
-
+      status: !acquired
+        ? "NEW"
+        : word.memory.state === "RELEARNING"
+        ? "RELEARNING"
+        : needsPractice
+        ? "WEAK"
+        : "LEARNING",
       weakestSkill: getWeakestSkill(skills),
     };
   }
@@ -104,13 +109,14 @@ export function calculateWeakProfile(word) {
   // RELEARNING yêu cầu từ từng được nhớ đúng trong FSRS,
   // không chỉ đúng ở bài kiểm tra trong lúc đang học từ mới.
   if (
-    reviews.length >= 4 &&
-    hadPreviousSuccess &&
-    hadFsrsSuccess &&
-    recentFailures >= 0.5
+    word.memory?.state === "RELEARNING" ||
+    (hadPreviousSuccess && hadFsrsSuccess && recentFailures >= 0.5)
   ) {
     status = "RELEARNING";
-  } else if (score >= 0.65) {
+  } else if (
+    score >= 0.58 ||
+    (Math.min(...SKILLS.map((key) => skills[key])) < 0.35 && mastery < 0.65)
+  ) {
     status = "WEAK";
   } else if (mastery >= 0.82) {
     status = "STRONG";
@@ -182,47 +188,65 @@ export async function getAcquiredVocabularyIdSet(vocabularyIds = []) {
   return eligible;
 }
 
+/** Acquisition logs are not forgetting evidence. Use post-Final reviews only. */
+export async function getPostAcquisitionWords(words) {
+  const ids = words.map((w) => w.id);
+  const acquired = await getAcquiredVocabularyIdSet(ids);
+  const finished = await prisma.newLearningProgress.findMany({
+    where: {
+      vocabularyId: { in: ids },
+      finalPass: true,
+      masteredAt: { not: null },
+    },
+    select: { vocabularyId: true, masteredAt: true },
+    orderBy: { masteredAt: "asc" },
+  });
+  const firstMastery = new Map();
+  for (const row of finished)
+    if (!firstMastery.has(row.vocabularyId)) {
+      firstMastery.set(row.vocabularyId, row.masteredAt);
+    }
+  return words
+    .filter((word) => acquired.has(word.id))
+    .map((word) => {
+      const time = firstMastery.get(word.id);
+      const reviews = (word.reviews || []).filter((review) =>
+        time
+          ? new Date(review.reviewedAt).getTime() >
+            new Date(time).getTime() + 1000
+          : review.exerciseType === "FLASHCARD",
+      );
+      return { ...word, reviews, acquisitionFinishedAt: time || null };
+    });
+}
+
 export async function getWeakWords({ limit = 50 } = {}) {
   const words = await prisma.vocabulary.findMany({
     include: {
       skill: true,
       memory: true,
-
-      reviews: {
-        orderBy: {
-          reviewedAt: "desc",
-        },
-
-        take: 20,
-      },
+      reviews: { orderBy: { reviewedAt: "desc" }, take: 20 },
     },
-
-    orderBy: {
-      createdAt: "desc",
-    },
+    orderBy: { createdAt: "desc" },
   });
-
-  const acquired = await getAcquiredVocabularyIdSet(
-    words.map((word) => word.id),
+  const ready = await getPostAcquisitionWords(words);
+  const now = Date.now();
+  return (
+    ready
+      // Don't immediately reassign newly acquired words in the same sitting.
+      .filter(
+        (w) =>
+          !w.acquisitionFinishedAt ||
+          now - new Date(w.acquisitionFinishedAt).getTime() >=
+            12 * 60 * 60 * 1000,
+      )
+      .map((word) => ({ ...word, weakProfile: calculateWeakProfile(word) }))
+      .filter((word) =>
+        ["WEAK", "RELEARNING"].includes(word.weakProfile.status),
+      )
+      .sort((a, b) => b.weakProfile.score - a.weakProfile.score)
+      .slice(0, limit)
   );
-
-  return words
-    .filter(
-      (word) =>
-        acquired.has(word.id) && Number(word.memory?.totalReviews || 0) > 0,
-    )
-    .map((word) => ({
-      ...word,
-
-      weakProfile: calculateWeakProfile(word),
-    }))
-    .filter(
-      (word) =>
-        word.weakProfile.status === "WEAK" ||
-        word.weakProfile.status === "RELEARNING",
-    )
-    .sort((a, b) => b.weakProfile.score - a.weakProfile.score)
-    .slice(0, limit);
 }
 
 export async function getWeakWordStats() {
@@ -230,43 +254,21 @@ export async function getWeakWordStats() {
     include: {
       skill: true,
       memory: true,
-
-      reviews: {
-        orderBy: {
-          reviewedAt: "desc",
-        },
-
-        take: 20,
-      },
+      reviews: { orderBy: { reviewedAt: "desc" }, take: 20 },
     },
   });
-
-  const acquired = await getAcquiredVocabularyIdSet(
-    words.map((word) => word.id),
-  );
+  const ready = await getPostAcquisitionWords(words);
+  const readyMap = new Map(ready.map((word) => [word.id, word]));
   const profiles = words.map((word) => {
-    if (!acquired.has(word.id)) {
-      return { status: "NEW" };
-    }
-    if (Number(word.memory?.totalReviews || 0) === 0) {
-      return { status: "LEARNING" };
-    }
-    return calculateWeakProfile(word);
+    const acquired = readyMap.get(word.id);
+    return acquired ? calculateWeakProfile(acquired) : { status: "NEW" };
   });
-
   return {
     total: words.length,
-
-    newWords: profiles.filter((profile) => profile.status === "NEW").length,
-
-    learning: profiles.filter((profile) => profile.status === "LEARNING")
-      .length,
-
-    weak: profiles.filter((profile) => profile.status === "WEAK").length,
-
-    relearning: profiles.filter((profile) => profile.status === "RELEARNING")
-      .length,
-
-    strong: profiles.filter((profile) => profile.status === "STRONG").length,
+    newWords: profiles.filter((p) => p.status === "NEW").length,
+    learning: profiles.filter((p) => p.status === "LEARNING").length,
+    weak: profiles.filter((p) => p.status === "WEAK").length,
+    relearning: profiles.filter((p) => p.status === "RELEARNING").length,
+    strong: profiles.filter((p) => p.status === "STRONG").length,
   };
 }

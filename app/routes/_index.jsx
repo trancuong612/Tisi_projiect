@@ -1,6 +1,6 @@
-import { Link, useLoaderData } from "@remix-run/react";
+import { Form, Link, useLoaderData } from "@remix-run/react";
 
-import { json } from "@remix-run/node";
+import { json, redirect } from "@remix-run/node";
 
 import {
   Brain,
@@ -21,6 +21,7 @@ import {
 import DesktopHeader from "../components/DesktopHeader";
 
 import { getDailyLearningQueue } from "../services/daily-learning.server";
+import { addOptionalDueBatch } from "../services/daily-session.server";
 import { getAdaptiveRecommendation } from "../services/adaptive-recommendation.server";
 export async function loader() {
   const [daily, recommendation] = await Promise.all([
@@ -35,6 +36,20 @@ export async function loader() {
   });
 }
 
+// Ôn thêm chỉ khi người học chủ động yêu cầu, không tự tăng nhiệm vụ.
+export async function action({ request }) {
+  const form = await request.formData();
+  if (form.get("intent") !== "due-more") {
+    throw new Response("Unknown action", { status: 400 });
+  }
+  const daily = await getDailyLearningQueue();
+  await addOptionalDueBatch({
+    sessionId: daily.sessionId,
+    dateKey: daily.date.dateKey,
+  });
+  return redirect("/");
+}
+
 function getQueueIcon(key) {
   switch (key) {
     case "DUE":
@@ -45,6 +60,9 @@ function getQueueIcon(key) {
 
     case "NEW":
       return Sparkles;
+
+    case "CARRYOVER":
+      return RotateCcw;
 
     case "WEAK":
       return Activity;
@@ -80,6 +98,9 @@ function getQueueStyle(key) {
         count: "text-emerald-700",
       };
 
+    case "CARRYOVER":
+      return { icon: "bg-cyan-100 text-cyan-700", count: "text-cyan-700" };
+
     case "WEAK":
       return {
         icon: "bg-amber-100 text-amber-700",
@@ -103,7 +124,7 @@ function getQueueStyle(key) {
   }
 }
 
-function getStatusLabel(status) {
+function getStatusLabel(status, mergedDue = 0, deferredDue = 0) {
   switch (status) {
     case "DONE":
       return "Hoàn thành";
@@ -112,7 +133,11 @@ function getStatusLabel(status) {
       return "Đang học";
 
     case "NOT_REQUIRED":
-      return "Không cần";
+      return mergedDue > 0
+        ? `${mergedDue} từ nằm trong DUE hôm nay`
+        : deferredDue > 0
+        ? `${deferredDue} từ đang chờ lượt FSRS`
+        : "Chưa có bài riêng";
 
     default:
       return "Chưa bắt đầu";
@@ -229,7 +254,7 @@ export default function Home() {
                 </div>
 
                 <h2 className="mt-2 text-xl font-black text-slate-900">
-                  Hôm nay hệ thống đã điều chỉnh khối lượng học
+                  Tisi đang nhắc bạn ưu tiên cân đối việc ôn tập
                 </h2>
 
                 <p className="mt-2 text-sm font-semibold leading-6 text-slate-600">
@@ -262,12 +287,64 @@ export default function Home() {
 
             {workload.mode === "RECOVERY" && (
               <p className="mt-4 text-xs font-bold leading-5 text-violet-700">
-                Từ mới có thể được tạm hoãn để ưu tiên phục hồi kiến thức đã
-                học.
+                Từ mới theo chương trình vẫn được giữ đủ. Phần nợ ôn và từ học
+                dở được chia nhỏ qua các ngày.
               </p>
             )}
           </section>
         )}
+
+        {/* BUDGET / DEFERRED QUEUES */}
+        <section className="mt-5 rounded-[2rem] border border-blue-100 bg-blue-50 p-5">
+          <p className="text-xs font-black uppercase tracking-[0.14em] text-blue-700">
+            Kế hoạch vừa sức
+          </p>
+          <h2 className="mt-2 text-lg font-black text-slate-900">
+            Học đủ từ mới, chia nhỏ phần ôn
+          </h2>
+          <p className="mt-2 text-sm font-semibold leading-6 text-slate-600">
+            Hôm nay ưu tiên {workload.selected.due} từ ôn đến hạn và{" "}
+            {workload.selected.carryover} từ tồn.
+            {workload.deferred.due > 0
+              ? ` Còn ${workload.deferred.due} từ FSRS quá hạn trong hàng đợi, không bị xóa hay đổi lịch.`
+              : " Không còn từ FSRS quá hạn đang bị hoãn."}
+            {workload.deferred.carryover > 0
+              ? ` Còn ${workload.deferred.carryover} từ chưa học xong sẽ được ưu tiên tiếp tục những ngày sau.`
+              : ""}
+          </p>
+          {workload.overlap &&
+            (workload.overlap.dueWeak > 0 ||
+              workload.overlap.dueRelearning > 0 ||
+              workload.overlap.deferredDueWeak > 0 ||
+              workload.overlap.deferredDueRelearning > 0) && (
+              <p className="mt-2 text-xs font-semibold text-blue-800">
+                {workload.overlap.dueWeak} từ yếu và{" "}
+                {workload.overlap.dueRelearning} từ cần học lại nằm trong DUE
+                được giao hôm nay; không giao trùng.
+                {workload.overlap.deferredDueWeak +
+                  workload.overlap.deferredDueRelearning >
+                  0 &&
+                  ` Ngoài ra, ${
+                    workload.overlap.deferredDueWeak +
+                    workload.overlap.deferredDueRelearning
+                  } từ yếu/đang quên còn chờ lượt FSRS.`}
+              </p>
+            )}
+          {workload.deferred.due > 0 && (
+            <Form method="post" className="mt-4">
+              <input type="hidden" name="intent" value="due-more" />
+              <button
+                type="submit"
+                className="rounded-xl bg-blue-700 px-4 py-3 text-sm font-black text-white">
+                + Chủ động ôn thêm tối đa 10 từ
+              </button>
+            </Form>
+          )}
+          <p className="mt-3 text-xs font-medium text-slate-500">
+            Hoàn thành 100% nghĩa là hoàn thành kế hoạch hôm nay, không phải đã
+            hết toàn bộ backlog.
+          </p>
+        </section>
 
         {/* ADAPTIVE RECOMMENDATION */}
         {recommendation?.hasData && recommendation.primaryFocus && (
@@ -471,7 +548,7 @@ function QueueItem({ item, index, isNext }) {
         <div className="mt-1 font-black text-slate-800">{item.title}</div>
 
         <div className="mt-1 text-xs font-semibold text-slate-400">
-          {getStatusLabel(item.status)}
+          {getStatusLabel(item.status, item.mergedDue, item.deferredDue)}
         </div>
       </div>
 

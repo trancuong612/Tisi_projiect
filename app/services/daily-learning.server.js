@@ -7,6 +7,7 @@ import { buildDailyWorkload } from "./daily-workload.server";
 import {
   getOrCreateDailySession,
   getDailySessionProgress,
+  getCarryoverTargets,
 } from "./daily-session.server";
 
 const DAY_MAP = {
@@ -133,6 +134,85 @@ async function getTodayLessons({ weekId, dayEnum }) {
   });
 }
 
+/** Collect unfinished vocabulary from previously scheduled lessons, including words
+ * that Busy/Recovery mode never assigned. Requires no schema migration. */
+async function findCarryoverIds(
+  dateKey,
+  todayCurriculumIds,
+  activeWeekNumber,
+  dayEnum,
+) {
+  const previous = await prisma.dailySession.findMany({
+    where: { dateKey: { lt: dateKey } },
+    orderBy: { dateKey: "asc" },
+    select: {
+      day: true,
+      weekNumber: true,
+      newTargets: true,
+      workloadMeta: true,
+    },
+  });
+  // No previous snapshot is normal when returning after days away.
+
+  const weekNumbers = [
+    ...new Set(
+      [...previous.map((s) => s.weekNumber), activeWeekNumber].filter(
+        (n) => n != null,
+      ),
+    ),
+  ];
+  const lessons = weekNumbers.length
+    ? await prisma.lesson.findMany({
+        where: { week: { number: { in: weekNumbers } } },
+        include: {
+          week: { select: { number: true } },
+          vocabulary: { select: { id: true } },
+        },
+      })
+    : [];
+  const byLessonDay = new Map();
+  for (const lesson of lessons) {
+    const key = `${lesson.week.number}:${lesson.day}`;
+    byLessonDay.set(key, [
+      ...(byLessonDay.get(key) || []),
+      ...lesson.vocabulary.map((v) => v.id),
+    ]);
+  }
+
+  const ids = new Set();
+  for (const past of previous) {
+    for (const id of Array.isArray(past.newTargets) ? past.newTargets : [])
+      ids.add(id);
+    for (const id of Array.isArray(past.workloadMeta?.carryoverTargets)
+      ? past.workloadMeta.carryoverTargets
+      : [])
+      ids.add(id);
+    for (const id of byLessonDay.get(`${past.weekNumber}:${past.day}`) || [])
+      ids.add(id);
+  }
+  // A weekday can be skipped entirely without a DailySession record.
+  // Earlier days in the currently active week must still become carryover.
+  const order = [
+    "MONDAY",
+    "TUESDAY",
+    "WEDNESDAY",
+    "THURSDAY",
+    "FRIDAY",
+    "SATURDAY",
+    "SUNDAY",
+  ];
+  const dayIndex = order.indexOf(dayEnum);
+  if (activeWeekNumber != null && dayIndex >= 0) {
+    for (let i = 0; i < dayIndex; i++) {
+      for (const id of byLessonDay.get(`${activeWeekNumber}:${order[i]}`) || [])
+        ids.add(id);
+    }
+  }
+  for (const id of todayCurriculumIds) ids.delete(id);
+  const acquired = await getAcquiredVocabularyIdSet([...ids]);
+  return [...ids].filter((id) => !acquired.has(id));
+}
+
 export async function getDailyLearningQueue() {
   const now = new Date();
 
@@ -155,6 +235,12 @@ export async function getDailyLearningQueue() {
   const acquiredCurriculum = await getAcquiredVocabularyIdSet(curriculumIds);
   const newWordIds = [...new Set(curriculumIds)].filter(
     (id) => !acquiredCurriculum.has(id),
+  );
+  const carryoverIds = await findCarryoverIds(
+    dateInfo.dateKey,
+    curriculumIds,
+    activeWeek?.number ?? null,
+    dateInfo.dayEnum,
   );
 
   /**
@@ -257,6 +343,8 @@ export async function getDailyLearningQueue() {
 
     readings: readingIds,
 
+    carryoverIds,
+
     workloadMode: workload.mode,
 
     workloadMeta: {
@@ -269,8 +357,38 @@ export async function getDailyLearningQueue() {
       selected: workload.selected,
 
       deferred: workload.deferred,
+      limits: workload.limits,
+      overlap: workload.overlap,
+      rawCarryover: carryoverIds.length,
     },
   });
+
+  // Classify by the ACTUAL saved daily snapshot (including voluntary +10).
+  // Some overdue cards remain in backlog, not in today's assigned DUE bucket.
+  const assignedDueSet = new Set(
+    Array.isArray(session.dueTargets) ? session.dueTargets : [],
+  );
+  const rawDueSet = new Set(dueMemories.map((m) => m.vocabularyId));
+  const overlap = {
+    dueWeak: weakWords.filter(
+      (w) => w.weakProfile.status === "WEAK" && assignedDueSet.has(w.id),
+    ).length,
+    dueRelearning: weakWords.filter(
+      (w) => w.weakProfile.status === "RELEARNING" && assignedDueSet.has(w.id),
+    ).length,
+    deferredDueWeak: weakWords.filter(
+      (w) =>
+        w.weakProfile.status === "WEAK" &&
+        rawDueSet.has(w.id) &&
+        !assignedDueSet.has(w.id),
+    ).length,
+    deferredDueRelearning: weakWords.filter(
+      (w) =>
+        w.weakProfile.status === "RELEARNING" &&
+        rawDueSet.has(w.id) &&
+        !assignedDueSet.has(w.id),
+    ).length,
+  };
 
   const progress = await getDailySessionProgress(session);
 
@@ -304,6 +422,8 @@ export async function getDailyLearningQueue() {
 
       priority: 2,
 
+      mergedDue: overlap.dueRelearning,
+      deferredDue: overlap.deferredDueRelearning,
       ...stepMap.RELEARNING,
     },
 
@@ -322,6 +442,16 @@ export async function getDailyLearningQueue() {
     },
 
     {
+      key: "CARRYOVER",
+      title: "Tiếp tục từ chưa hoàn thành",
+      description:
+        "Từ học dở hoặc chưa được giao ở các ngày trước. Giữ lại các checkpoint đã đạt.",
+      path: "/learn?mode=carryover",
+      priority: 4,
+      ...stepMap.CARRYOVER,
+    },
+
+    {
       key: "WEAK",
 
       title: "Củng cố từ yếu",
@@ -330,8 +460,10 @@ export async function getDailyLearningQueue() {
 
       path: "/practice?mode=weak",
 
-      priority: 4,
+      priority: 5,
 
+      mergedDue: overlap.dueWeak,
+      deferredDue: overlap.deferredDueWeak,
       ...stepMap.WEAK,
     },
 
@@ -344,7 +476,7 @@ export async function getDailyLearningQueue() {
 
       path: "/reader",
 
-      priority: 5,
+      priority: 6,
 
       ...stepMap.READING,
     },
@@ -405,6 +537,9 @@ export async function getDailyLearningQueue() {
       ? session.relearningTargets.length
       : 0,
     newWords: Array.isArray(session.newTargets) ? session.newTargets.length : 0,
+    carryover: Array.isArray(session.workloadMeta?.carryoverTargets)
+      ? session.workloadMeta.carryoverTargets.length
+      : 0,
     weak: Array.isArray(session.weakTargets) ? session.weakTargets.length : 0,
   };
   sessionSelected.total = Object.values(sessionSelected).reduce(
@@ -412,7 +547,9 @@ export async function getDailyLearningQueue() {
     0,
   );
 
-  const raw = savedMeta.raw || workload.raw;
+  const raw = { ...workload.raw, carryover: carryoverIds.length };
+  raw.total =
+    raw.due + raw.relearning + raw.weak + raw.newWords + raw.carryover;
   const deferred = {
     due: Math.max(0, Number(raw.due || 0) - sessionSelected.due),
     relearning: Math.max(
@@ -421,9 +558,26 @@ export async function getDailyLearningQueue() {
     ),
     weak: Math.max(0, Number(raw.weak || 0) - sessionSelected.weak),
     newWords: Math.max(0, Number(raw.newWords || 0) - sessionSelected.newWords),
+    carryover: 0,
   };
+  // Số tồn chính xác phải dựa trên các IDs đang đến hạn tại thời điểm này,
+  // không lấy raw cũ hoặc trừ các lượt đã hoàn thành từ nhiều giờ trước.
+  const sessionDueSet = new Set(
+    Array.isArray(session.dueTargets) ? session.dueTargets : [],
+  );
+  deferred.due = dueMemories.filter(
+    (m) => !sessionDueSet.has(m.vocabularyId),
+  ).length;
+  const sessionCarryoverSet = new Set(getCarryoverTargets(session));
+  deferred.carryover = carryoverIds.filter(
+    (id) => !sessionCarryoverSet.has(id),
+  ).length;
   deferred.total =
-    deferred.due + deferred.relearning + deferred.weak + deferred.newWords;
+    deferred.due +
+    deferred.relearning +
+    deferred.weak +
+    deferred.newWords +
+    deferred.carryover;
 
   return {
     sessionId: session.id,
@@ -467,6 +621,8 @@ export async function getDailyLearningQueue() {
       selected: sessionSelected,
 
       deferred,
+      limits: session.workloadMeta?.limits || workload.limits,
+      overlap,
     },
 
     progress,

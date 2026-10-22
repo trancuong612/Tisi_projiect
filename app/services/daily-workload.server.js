@@ -10,20 +10,24 @@ const DAY_MS = 24 * 60 * 60 * 1000;
  * giới hạn tạm thời khi backlog cao.
  */
 const CONFIG = {
+  // Daily core review caps. These are TASK caps, not changes to FSRS due dates.
+  normalDueCap: 20,
+  busyDueCap: 12,
+  recoveryDueCap: 10,
+
+  normalCarryoverCap: 5,
+  busyCarryoverCap: 3,
+  recoveryCarryoverCap: 3,
+
+  normalExtraPracticeCap: 4,
+  busyExtraPracticeCap: 2,
+  recoveryExtraPracticeCap: 1,
+
   busyDueThreshold: 40,
   recoveryDueThreshold: 80,
 
   busyGapDays: 3,
   recoveryGapDays: 7,
-
-  busyDueCap: 30,
-  busyRelearningCap: 8,
-  busyWeakCap: 6,
-  busyNewRatio: 0.5,
-
-  recoveryDueCap: 25,
-  recoveryRelearningCap: 8,
-  recoveryWeakCap: 5,
 };
 
 function clamp(value, min, max) {
@@ -87,7 +91,9 @@ function chooseMode({ dueCount, daysSinceLastActivity }) {
 function takeIds(items, limit) {
   return items
     .slice(0, limit)
-    .map((item) => (typeof item === "string" ? item : item.id));
+    .map((item) =>
+      typeof item === "string" ? item : item.vocabularyId || item.id,
+    );
 }
 
 function uniqueIds(values) {
@@ -128,10 +134,10 @@ function enforceUniqueTargets(targets) {
     return result;
   }
 
-  const relearning = takeUnique(targets.relearning || []);
-  const due = takeUnique(targets.due || []);
-  const weak = takeUnique(targets.weak || []);
   const newWords = takeUnique(targets.newWords || []);
+  const due = takeUnique(targets.due || []);
+  const relearning = takeUnique(targets.relearning || []);
+  const weak = takeUnique(targets.weak || []);
 
   return {
     due,
@@ -153,8 +159,14 @@ export function buildDailyWorkload({
   /**
    * 1. RELEARNING có priority cao nhất.
    */
+  // FSRS due always wins over optional practice. Never suppress an actual due.
+  const mandatoryNewIds = new Set(newWordIds);
+  const allDueIds = new Set(dueMemories.map((memory) => memory.vocabularyId));
   const relearningWords = weakWords.filter(
-    (word) => word.weakProfile.status === "RELEARNING",
+    (word) =>
+      word.weakProfile.status === "RELEARNING" &&
+      !allDueIds.has(word.id) &&
+      !mandatoryNewIds.has(word.id),
   );
 
   const relearningIds = new Set(relearningWords.map((word) => word.id));
@@ -166,7 +178,11 @@ export function buildDailyWorkload({
    * thì không được xuất hiện thêm trong DUE.
    */
   const rankedDue = dueMemories
-    .filter((memory) => !relearningIds.has(memory.vocabularyId))
+    .filter(
+      (memory) =>
+        !relearningIds.has(memory.vocabularyId) &&
+        !mandatoryNewIds.has(memory.vocabularyId),
+    )
     .map((memory) => ({
       ...memory,
       priority: getDuePriority(memory, now),
@@ -200,7 +216,8 @@ export function buildDailyWorkload({
     (word) =>
       word.weakProfile.status === "WEAK" &&
       !relearningIds.has(word.id) &&
-      !dueIds.has(word.id),
+      !dueIds.has(word.id) &&
+      !mandatoryNewIds.has(word.id),
   );
 
   const weakIds = new Set(weakOnlyWords.map((word) => word.id));
@@ -212,51 +229,69 @@ export function buildDailyWorkload({
    * nhưng vẫn phòng thủ dữ liệu để
    * một ID chỉ có đúng một nhiệm vụ.
    */
-  const cleanedNewWordIds = uniqueIds(newWordIds).filter(
-    (id) => !relearningIds.has(id) && !dueIds.has(id) && !weakIds.has(id),
-  );
+  const cleanedNewWordIds = uniqueIds(newWordIds);
 
   const mode = chooseMode({
     dueCount: rankedDue.length,
     daysSinceLastActivity,
   });
 
-  let targets;
+  // Daily budget: NEW follows curriculum unchanged; optional practice shares
+  // ONE small cap, not two independent caps. DUE can be extended voluntarily.
+  const limits =
+    mode === "RECOVERY"
+      ? {
+          due: CONFIG.recoveryDueCap,
+          carryover: CONFIG.recoveryCarryoverCap,
+          practice: CONFIG.recoveryExtraPracticeCap,
+        }
+      : mode === "BUSY"
+      ? {
+          due: CONFIG.busyDueCap,
+          carryover: CONFIG.busyCarryoverCap,
+          practice: CONFIG.busyExtraPracticeCap,
+        }
+      : {
+          due: CONFIG.normalDueCap,
+          carryover: CONFIG.normalCarryoverCap,
+          practice: CONFIG.normalExtraPracticeCap,
+        };
 
-  if (mode === "RECOVERY") {
-    targets = {
-      relearning: takeIds(relearningWords, CONFIG.recoveryRelearningCap),
-
-      due: takeIds(rankedDue, CONFIG.recoveryDueCap),
-
-      weak: takeIds(weakOnlyWords, CONFIG.recoveryWeakCap),
-
-      newWords: [],
-    };
-  } else if (mode === "BUSY") {
-    targets = {
-      relearning: takeIds(relearningWords, CONFIG.busyRelearningCap),
-
-      due: takeIds(rankedDue, CONFIG.busyDueCap),
-
-      weak: takeIds(weakOnlyWords, CONFIG.busyWeakCap),
-
-      newWords: cleanedNewWordIds.slice(
-        0,
-        Math.ceil(cleanedNewWordIds.length * CONFIG.busyNewRatio),
-      ),
-    };
-  } else {
-    targets = {
-      relearning: relearningWords.map((word) => word.id),
-
-      due: rankedDue.map((memory) => memory.vocabularyId),
-
-      weak: weakOnlyWords.map((word) => word.id),
-
-      newWords: [...cleanedNewWordIds],
-    };
+  const dueSelected = takeIds(rankedDue, limits.due);
+  // If both groups exist, reserve at least one place for each when possible.
+  // The two groups SHARE the cap; they are not independent workloads.
+  const reQuota =
+    weakOnlyWords.length > 0 && limits.practice >= 2
+      ? Math.ceil(limits.practice / 2)
+      : limits.practice;
+  let relearningSelected = takeIds(relearningWords, reQuota);
+  let weakSelected = takeIds(
+    weakOnlyWords,
+    Math.max(0, limits.practice - relearningSelected.length),
+  );
+  let spare = Math.max(
+    0,
+    limits.practice - relearningSelected.length - weakSelected.length,
+  );
+  if (spare > 0) {
+    relearningSelected = takeIds(
+      relearningWords,
+      relearningSelected.length + spare,
+    );
+    spare = Math.max(
+      0,
+      limits.practice - relearningSelected.length - weakSelected.length,
+    );
   }
+  if (spare > 0)
+    weakSelected = takeIds(weakOnlyWords, weakSelected.length + spare);
+  let targets = {
+    due: dueSelected,
+    relearning: relearningSelected,
+    weak: weakSelected,
+    // Never reduce the user's scheduled new words, including BUSY/RECOVERY.
+    newWords: [...cleanedNewWordIds],
+  };
 
   /**
    * Safety net cuối cùng.
@@ -265,6 +300,30 @@ export function buildDailyWorkload({
    * targets trả về vẫn tuyệt đối không trùng ID.
    */
   targets = enforceUniqueTargets(targets);
+
+  // Distinguish TODAY's assigned DUE cards from deferred FSRS backlog.
+  // A weak overdue card not assigned today is NOT "already practised today".
+  const assignedDueIds = new Set(targets.due);
+  const overlap = {
+    dueRelearning: weakWords.filter(
+      (w) => w.weakProfile.status === "RELEARNING" && assignedDueIds.has(w.id),
+    ).length,
+    dueWeak: weakWords.filter(
+      (w) => w.weakProfile.status === "WEAK" && assignedDueIds.has(w.id),
+    ).length,
+    deferredDueRelearning: weakWords.filter(
+      (w) =>
+        w.weakProfile.status === "RELEARNING" &&
+        allDueIds.has(w.id) &&
+        !assignedDueIds.has(w.id),
+    ).length,
+    deferredDueWeak: weakWords.filter(
+      (w) =>
+        w.weakProfile.status === "WEAK" &&
+        allDueIds.has(w.id) &&
+        !assignedDueIds.has(w.id),
+    ).length,
+  };
 
   /**
    * RAW cũng phải phản ánh số nhiệm vụ
@@ -311,14 +370,14 @@ export function buildDailyWorkload({
     ) {
       reason =
         `Bạn quay lại sau khoảng ${daysSinceLastActivity} ngày. ` +
-        "Hệ thống tạm giảm tải và ưu tiên kiến thức cũ trước.";
+        "Tisi ưu tiên nhắc lịch ôn; đủ từ mới theo lịch vẫn được giữ nguyên.";
     } else {
       reason =
-        "Backlog ôn tập đang lớn. Hệ thống chia nhỏ phần cần xử lý để tránh quá tải.";
+        "Nợ ôn đang cao. Tisi giao một phần ôn ưu tiên hôm nay; phần còn lại vẫn giữ nguyên hạn FSRS.";
     }
   } else if (mode === "BUSY") {
     reason =
-      "Khối lượng ôn đang cao hơn bình thường. Hệ thống giảm lượng từ mới và ưu tiên kiến thức cũ.";
+      "Khối lượng lớn: giữ đủ từ mới, chia nhỏ nợ ôn, và chỉ giao ít bài củng cố. Bạn có thể chọn ôn thêm.";
   } else {
     reason =
       "Khối lượng hiện tại đang cân bằng. Bạn có thể tiếp tục curriculum bình thường.";
@@ -334,5 +393,7 @@ export function buildDailyWorkload({
     deferred,
 
     targets,
+    limits,
+    overlap,
   };
 }

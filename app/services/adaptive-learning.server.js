@@ -2,6 +2,7 @@ import { prisma } from "../utils/db.server";
 import {
   calculateWeakProfile,
   getAcquiredVocabularyIdSet,
+  getPostAcquisitionWords,
 } from "./weak-words.server";
 import { getAdaptiveRecommendation } from "./adaptive-recommendation.server";
 const PRACTICE_SKILLS = ["meaningRecall", "spelling", "listening", "usage"];
@@ -339,6 +340,7 @@ export async function getAdaptiveExercise({
       where: {
         vocabularyId: { in: ids },
         reviewedAt: { gte: session.startedAt },
+        correct: true,
       },
       select: { vocabularyId: true },
       distinct: ["vocabularyId"],
@@ -366,8 +368,7 @@ export async function getAdaptiveExercise({
 
   // Dữ liệu từ New Learning có ReviewLog nhưng chưa qua Final
   // phải bị chặn, kể cả đang lưu MemoryState = LEARNING.
-  const acquired = await getAcquiredVocabularyIdSet(words.map((w) => w.id));
-  const ready = words.filter((word) => acquired.has(word.id));
+  const ready = await getPostAcquisitionWords(words);
   if (!ready.length) return null;
 
   const ranked = ready
@@ -521,6 +522,7 @@ export async function gradeAdaptiveAnswer({
       where: {
         vocabularyId,
         reviewedAt: { gte: session.startedAt },
+        correct: true,
       },
       select: { id: true },
     });

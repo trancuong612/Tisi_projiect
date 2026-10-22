@@ -11,6 +11,10 @@ function unique(values) {
   return [...new Set((values || []).filter(Boolean))];
 }
 
+export function getCarryoverTargets(session) {
+  return toArray(session?.workloadMeta?.carryoverTargets);
+}
+
 /**
  * Một vocabulary chỉ được xuất hiện
  * trong MỘT bucket của Daily Session.
@@ -18,9 +22,9 @@ function unique(values) {
  * Priority:
  * NEW (incomplete acquisition)
  * ↓
- * RELEARNING
+ * DUE (FSRS)
  * ↓
- * DUE
+ * RELEARNING
  * ↓
  * WEAK
  */
@@ -48,8 +52,8 @@ function sanitizeSessionTargets({
   }
 
   const cleanNew = takeUnique(newWords);
-  const cleanRelearning = takeUnique(relearning);
   const cleanDue = takeUnique(due);
+  const cleanRelearning = takeUnique(relearning);
   const cleanWeak = takeUnique(weak);
 
   return {
@@ -84,126 +88,256 @@ function arraysEqual(a, b) {
   return JSON.stringify(a) === JSON.stringify(b);
 }
 
+// Daily core budget is intentionally limited. Completed work is always kept.
+// Pending work that doesn't fit stays in FSRS/carryover queues for later days.
+function takeBudgeted(completed, candidates, cap, forbidden = new Set()) {
+  const kept = unique(completed).filter((id) => !forbidden.has(id));
+  const used = new Set([...forbidden, ...kept]);
+  const free = Math.max(0, cap - kept.length);
+  const pending = [];
+  for (const id of unique(candidates)) {
+    if (pending.length >= free) break;
+    if (used.has(id)) continue;
+    pending.push(id);
+    used.add(id);
+    if (pending.length >= free) break;
+  }
+  return [...kept, ...pending];
+}
+
+async function findCompletedIds(ids, startedAt, exerciseType = null) {
+  if (!ids.length) return [];
+  const rows = await prisma.reviewLog.findMany({
+    where: {
+      vocabularyId: { in: ids },
+      reviewedAt: { gte: startedAt },
+      correct: true,
+      ...(exerciseType ? { exerciseType } : {}),
+    },
+    select: { vocabularyId: true },
+    distinct: ["vocabularyId"],
+  });
+  return rows.map((r) => r.vocabularyId);
+}
+
+async function chooseCarryover(oldIds, candidates, cap, newIds) {
+  const ids = unique([...oldIds, ...candidates]).filter(
+    (id) => !newIds.includes(id),
+  );
+  if (!ids.length) return [];
+  const acquired = await getAcquiredVocabularyIdSet(ids);
+  const done = ids.filter((id) => acquired.has(id) && oldIds.includes(id));
+  const pending = ids.filter((id) => !acquired.has(id));
+  // Prefer words with acquisition checkpoints already started over untouched words.
+  const started = pending.length
+    ? await prisma.newLearningProgress.findMany({
+        where: { vocabularyId: { in: pending }, finalPass: false },
+        select: { vocabularyId: true, exposed: true, correctCount: true },
+      })
+    : [];
+  const score = new Map();
+  for (const row of started) {
+    score.set(
+      row.vocabularyId,
+      Math.max(
+        score.get(row.vocabularyId) || 0,
+        (row.exposed ? 1 : 0) + Math.max(0, row.correctCount || 0),
+      ),
+    );
+  }
+  const prioritized = pending
+    .map((id, index) => ({ id, index, priority: score.get(id) || 0 }))
+    .sort((a, b) => b.priority - a.priority || a.index - b.index)
+    .map((v) => v.id);
+  return takeBudgeted(done, prioritized, cap);
+}
+
 export async function getOrCreateDailySession({
   dateKey,
   day,
   weekNumber,
   targets,
   readings,
+  carryoverIds = [],
   workloadMode,
   workloadMeta,
 }) {
-  const existing = await prisma.dailySession.findUnique({
-    where: {
-      dateKey,
-    },
-  });
-
-  const cleanIncoming = await getSafeSessionTargets({
+  const existing = await prisma.dailySession.findUnique({ where: { dateKey } });
+  const input = await getSafeSessionTargets({
     due: toArray(targets?.due),
     relearning: toArray(targets?.relearning),
     weak: toArray(targets?.weak),
     newWords: toArray(targets?.newWords),
   });
+  const oldMeta =
+    existing?.workloadMeta && typeof existing.workloadMeta === "object"
+      ? existing.workloadMeta
+      : {};
+  // Freeze the CORE caps/mode for this calendar day. Otherwise crossing BUSY
+  // -> NORMAL would quietly create more required work during the same day.
+  const alreadyPlanned = oldMeta.planVersion === "balanced-v1";
+  const limits =
+    alreadyPlanned && oldMeta.baseLimits
+      ? oldMeta.baseLimits
+      : workloadMeta?.limits || { due: 20, carryover: 5, practice: 4 };
+  const effectiveMode = alreadyPlanned ? existing.workloadMode : workloadMode;
+  const extraDueSlots = Math.max(0, Number(oldMeta.extraDueSlots || 0));
+  const dueCap = Math.max(0, limits.due + extraDueSlots);
 
+  // Previously completed snapshots remain visible and counted, even if today's
+  // classification changes as FSRS schedules a new due date.
+  const oldNew = toArray(existing?.newTargets);
+  const newWords = unique([...oldNew, ...input.newWords]);
+  const oldDue = toArray(existing?.dueTargets);
+  const oldRelearning = toArray(existing?.relearningTargets);
+  const oldWeak = toArray(existing?.weakTargets);
+  const doneDue = existing
+    ? await findCompletedIds(oldDue, existing.startedAt, "FLASHCARD")
+    : [];
+  const doneRelearning = existing
+    ? await findCompletedIds(oldRelearning, existing.startedAt)
+    : [];
+  const doneWeak = existing
+    ? await findCompletedIds(oldWeak, existing.startedAt)
+    : [];
+
+  const priorCarryover = getCarryoverTargets(existing);
+  const carryover = await chooseCarryover(
+    priorCarryover,
+    unique(carryoverIds).filter((id) => !newWords.includes(id)),
+    Math.max(0, limits.carryover),
+    newWords,
+  );
+  const forbidden = new Set([...newWords, ...carryover]);
+  const validOldDue = oldDue.length
+    ? await prisma.memoryState.findMany({
+        where: {
+          vocabularyId: { in: oldDue },
+          due: { lte: new Date() },
+          state: { not: "NEW" },
+        },
+        select: { vocabularyId: true },
+      })
+    : [];
+  const stillAcquired = await getAcquiredVocabularyIdSet(
+    validOldDue.map((m) => m.vocabularyId),
+  );
+  // Keep today's assigned pending cards stable. After any FLASHCARD pass,
+  // do not silently swap them for other overdue cards from the backlog.
+  const dueCandidates = unique([
+    ...validOldDue
+      .map((m) => m.vocabularyId)
+      .filter((id) => stillAcquired.has(id)),
+    ...input.due,
+  ]);
+  const due = takeBudgeted(doneDue, dueCandidates, dueCap, forbidden);
+  for (const id of due) forbidden.add(id);
+  // Share one SMALL practice budget, not 2 separate caps.
+  const relearning = takeBudgeted(
+    doneRelearning,
+    input.relearning,
+    Math.max(0, limits.practice),
+    forbidden,
+  );
+  for (const id of relearning) forbidden.add(id);
+  const weak = takeBudgeted(
+    doneWeak,
+    input.weak,
+    Math.max(0, limits.practice - relearning.length),
+    forbidden,
+  );
+
+  const meta = {
+    ...oldMeta,
+    ...workloadMeta,
+    planVersion: "balanced-v1",
+    extraDueSlots,
+    baseLimits: limits,
+    reason: alreadyPlanned ? oldMeta.reason : workloadMeta.reason,
+    limits: { ...limits, due: dueCap },
+    carryoverTargets: carryover,
+    rawCarryover: carryoverIds.length,
+  };
+  const updates = {
+    dueTargets: due,
+    relearningTargets: relearning,
+    weakTargets: weak,
+    newTargets: newWords,
+    workloadMeta: meta,
+    workloadMode: effectiveMode,
+  };
   if (existing) {
-    /**
-     * Repair DailySession được tạo bởi
-     * phiên bản cũ nếu target bị duplicate.
-     */
-    const oldDue = toArray(existing.dueTargets);
-    const oldRelearning = toArray(existing.relearningTargets);
-    const oldWeak = toArray(existing.weakTargets);
-    const oldNew = toArray(existing.newTargets);
-
-    const cleanedExisting = await getSafeSessionTargets({
-      due: oldDue,
-      relearning: oldRelearning,
-      weak: oldWeak,
-      newWords: oldNew,
+    const changed =
+      !arraysEqual(toArray(existing.dueTargets), due) ||
+      !arraysEqual(toArray(existing.relearningTargets), relearning) ||
+      !arraysEqual(toArray(existing.weakTargets), weak) ||
+      !arraysEqual(toArray(existing.newTargets), newWords) ||
+      !arraysEqual(priorCarryover, carryover) ||
+      existing.workloadMode !== effectiveMode ||
+      JSON.stringify(oldMeta) !== JSON.stringify(meta);
+    if (!changed) return existing;
+    return prisma.dailySession.update({
+      where: { id: existing.id },
+      data: updates,
     });
-
-    const targetsChanged =
-      !arraysEqual(oldDue, cleanedExisting.due) ||
-      !arraysEqual(oldRelearning, cleanedExisting.relearning) ||
-      !arraysEqual(oldWeak, cleanedExisting.weak) ||
-      !arraysEqual(oldNew, cleanedExisting.newWords);
-
-    /**
-     * Session cũ chưa có metadata:
-     * nâng cấp bằng workload hiện tại.
-     */
-    if (!existing.workloadMeta) {
-      return prisma.dailySession.update({
-        where: {
-          id: existing.id,
-        },
-
-        data: {
-          workloadMode,
-          workloadMeta,
-
-          dueTargets: cleanIncoming.due,
-          relearningTargets: cleanIncoming.relearning,
-          weakTargets: cleanIncoming.weak,
-          newTargets: cleanIncoming.newWords,
-
-          readingTargets: unique(readings),
-
-          /**
-           * Không reset completedReadingTargets.
-           */
-        },
-      });
-    }
-
-    /**
-     * Session hôm nay đã tồn tại.
-     * Chỉ repair duplicate.
-     *
-     * Không rebuild toàn bộ snapshot,
-     * không reset tiến độ đã học.
-     */
-    if (targetsChanged) {
-      return prisma.dailySession.update({
-        where: {
-          id: existing.id,
-        },
-
-        data: {
-          dueTargets: cleanedExisting.due,
-          relearningTargets: cleanedExisting.relearning,
-          weakTargets: cleanedExisting.weak,
-          newTargets: cleanedExisting.newWords,
-        },
-      });
-    }
-
-    return existing;
   }
-
-  /**
-   * Session mới luôn được tạo
-   * bằng target đã sanitize.
-   */
   return prisma.dailySession.create({
     data: {
       dateKey,
       day,
       weekNumber,
-
-      dueTargets: cleanIncoming.due,
-      relearningTargets: cleanIncoming.relearning,
-      weakTargets: cleanIncoming.weak,
-      newTargets: cleanIncoming.newWords,
-
+      ...updates,
       readingTargets: unique(readings),
       completedReadingTargets: [],
-
-      workloadMode,
-      workloadMeta,
     },
   });
+}
+
+/** Explicit user choice: add 10 MORE overdue reviews to TODAY only.
+ * No FSRS schedule is modified, and no new words or history are deleted. */
+export async function addOptionalDueBatch({
+  sessionId,
+  dateKey,
+  batchSize = 10,
+}) {
+  const session = await prisma.dailySession.findUnique({
+    where: { id: sessionId },
+  });
+  if (!session || session.dateKey !== dateKey) {
+    throw new Response("Daily Session is not current", { status: 409 });
+  }
+  const used = new Set([
+    ...toArray(session.dueTargets),
+    ...toArray(session.relearningTargets),
+    ...toArray(session.weakTargets),
+    ...toArray(session.newTargets),
+    ...getCarryoverTargets(session),
+  ]);
+  const due = await prisma.memoryState.findMany({
+    where: { due: { lte: new Date() }, state: { not: "NEW" } },
+    orderBy: { due: "asc" },
+    select: { vocabularyId: true },
+  });
+  const candidates = due
+    .map((m) => m.vocabularyId)
+    .filter((id) => !used.has(id));
+  const acquired = await getAcquiredVocabularyIdSet(candidates);
+  const added = candidates
+    .filter((id) => acquired.has(id))
+    .slice(0, Math.min(10, batchSize));
+  if (!added.length) return 0;
+  const oldMeta = session.workloadMeta || {};
+  await prisma.dailySession.update({
+    where: { id: session.id },
+    data: {
+      dueTargets: [...toArray(session.dueTargets), ...added],
+      workloadMeta: {
+        ...oldMeta,
+        extraDueSlots: Number(oldMeta.extraDueSlots || 0) + added.length,
+      },
+    },
+  });
+  return added.length;
 }
 
 function buildStep({ key, total, completed }) {
@@ -240,6 +374,9 @@ export async function getDailySessionProgress(session) {
   const dueIds = toArray(session.dueTargets);
   const relearningIds = toArray(session.relearningTargets);
   const newIds = toArray(session.newTargets);
+  const carryoverIds = getCarryoverTargets(session).filter(
+    (id) => !newIds.includes(id),
+  );
   const weakIds = toArray(session.weakTargets);
 
   const readingIds = toArray(session.readingTargets);
@@ -252,6 +389,7 @@ export async function getDailySessionProgress(session) {
     ...relearningIds,
     ...weakIds,
     ...newIds,
+    ...carryoverIds,
   ]);
   const effectiveRelearningIds = relearningIds.filter((id) => acquired.has(id));
   const effectiveWeakIds = weakIds.filter((id) => acquired.has(id));
@@ -302,6 +440,8 @@ export async function getDailySessionProgress(session) {
             reviewedAt: {
               gte: session.startedAt,
             },
+            exerciseType: "FLASHCARD",
+            correct: true,
           },
 
           select: {
@@ -381,6 +521,7 @@ export async function getDailySessionProgress(session) {
           reviewedAt: {
             gte: session.startedAt,
           },
+          correct: true,
         },
 
         select: {
@@ -406,6 +547,9 @@ export async function getDailySessionProgress(session) {
    */
 
   const completedNew = newIds.filter((id) => acquired.has(id)).length;
+  const completedCarryover = carryoverIds.filter((id) =>
+    acquired.has(id),
+  ).length;
 
   /**
    * =====================================================
@@ -427,6 +571,7 @@ export async function getDailySessionProgress(session) {
           reviewedAt: {
             gte: session.startedAt,
           },
+          correct: true,
         },
 
         select: {
@@ -478,6 +623,12 @@ export async function getDailySessionProgress(session) {
       key: "NEW",
       total: newIds.length,
       completed: completedNew,
+    }),
+
+    buildStep({
+      key: "CARRYOVER",
+      total: carryoverIds.length,
+      completed: completedCarryover,
     }),
 
     buildStep({
@@ -569,6 +720,8 @@ export async function getNextSessionReviewWord(sessionId) {
           reviewedAt: {
             gte: session.startedAt,
           },
+          exerciseType: "FLASHCARD",
+          correct: true,
         },
 
         select: {
@@ -634,7 +787,7 @@ export async function getNextSessionReviewWord(sessionId) {
  *
  * Giữ đúng snapshot DailySession.
  */
-export async function getNextSessionNewWord(sessionId) {
+export async function getNextSessionNewWord(sessionId, lane = "new") {
   const session = await prisma.dailySession.findUnique({
     where: {
       id: sessionId,
@@ -642,6 +795,7 @@ export async function getNextSessionNewWord(sessionId) {
 
     select: {
       newTargets: true,
+      workloadMeta: true,
     },
   });
 
@@ -649,7 +803,10 @@ export async function getNextSessionNewWord(sessionId) {
     return null;
   }
 
-  const newIds = toArray(session.newTargets);
+  const newIds =
+    lane === "carryover"
+      ? getCarryoverTargets(session)
+      : toArray(session.newTargets);
 
   if (!newIds.length) {
     return null;
@@ -719,6 +876,7 @@ export async function activateSessionNewWord({ sessionId, vocabularyId }) {
 
     select: {
       newTargets: true,
+      workloadMeta: true,
     },
   });
 
@@ -728,7 +886,10 @@ export async function activateSessionNewWord({ sessionId, vocabularyId }) {
     });
   }
 
-  const newIds = toArray(session.newTargets);
+  const newIds = unique([
+    ...toArray(session.newTargets),
+    ...getCarryoverTargets(session),
+  ]);
 
   /**
    * Không cho route kích hoạt

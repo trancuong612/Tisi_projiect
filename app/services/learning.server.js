@@ -1,31 +1,48 @@
 import { prisma } from "../utils/db.server";
+import { getWeakWords, getAcquiredVocabularyIdSet } from "./weak-words.server";
 
 export async function getTodaySummary() {
   const now = new Date();
-  const [due, total, weak, readings] = await Promise.all([
-    prisma.memoryState.count({ where: { due: { lte: now } } }),
-    prisma.vocabulary.count(),
-    prisma.skillState.count({
-      where: {
-        OR: [
-          { meaningRecall: { lt: 0.45 } },
-          { listening: { lt: 0.35 } },
-          { spelling: { lt: 0.4 } },
-        ],
-      },
+  const [allDue, total, weakWords, readings] = await Promise.all([
+    prisma.memoryState.findMany({
+      where: { due: { lte: now }, state: { not: "NEW" } },
+      select: { vocabularyId: true },
     }),
+    prisma.vocabulary.count(),
+    getWeakWords({ limit: 10000 }),
     prisma.reading.count(),
   ]);
-  return { due, total, weak, readings };
+  const acquired = await getAcquiredVocabularyIdSet(
+    allDue.map((v) => v.vocabularyId),
+  );
+  return {
+    due: allDue.filter((v) => acquired.has(v.vocabularyId)).length,
+    total,
+    weak: weakWords.length,
+    readings,
+  };
 }
 
 export async function getReviewQueue(limit = 30) {
-  return prisma.vocabulary.findMany({
-    where: { memory: { due: { lte: new Date() } } },
-    include: { memory: true, skill: true, lesson: { include: { week: true } } },
-    orderBy: { memory: { due: "asc" } },
-    take: limit,
+  const now = new Date();
+  const memories = await prisma.memoryState.findMany({
+    where: { due: { lte: now }, state: { not: "NEW" } },
+    select: { vocabularyId: true },
+    orderBy: { due: "asc" },
   });
+  const acquired = await getAcquiredVocabularyIdSet(
+    memories.map((v) => v.vocabularyId),
+  );
+  const ids = memories
+    .map((v) => v.vocabularyId)
+    .filter((id) => acquired.has(id))
+    .slice(0, limit);
+  const words = await prisma.vocabulary.findMany({
+    where: { id: { in: ids } },
+    include: { memory: true, skill: true, lesson: { include: { week: true } } },
+  });
+  const map = new Map(words.map((word) => [word.id, word]));
+  return ids.map((id) => map.get(id)).filter(Boolean);
 }
 
 export async function getNewWords(limit = 30) {

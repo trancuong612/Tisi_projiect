@@ -12,6 +12,7 @@ import { scheduleReview } from "../services/fsrs.server";
 import { getDailyLearningQueue } from "../services/daily-learning.server";
 
 import { getNextSessionReviewWord } from "../services/daily-session.server";
+import { getAcquiredVocabularyIdSet } from "../services/weak-words.server";
 
 import DesktopHeader from "../components/DesktopHeader";
 import FlashCard from "../components/FlashCard";
@@ -38,9 +39,38 @@ export async function loader() {
 export async function action({ request }) {
   const form = await request.formData();
 
-  const vocabularyId = String(form.get("vocabularyId"));
-
+  const vocabularyId = String(form.get("vocabularyId") || "");
   const rating = Number(form.get("rating"));
+  if (![1, 2, 3, 4].includes(rating)) {
+    throw new Response("FSRS rating không hợp lệ", { status: 400 });
+  }
+  const daily = await getDailyLearningQueue();
+  const session = await prisma.dailySession.findUnique({
+    where: { id: daily.sessionId },
+    select: { dueTargets: true, startedAt: true },
+  });
+  const eligible = await getAcquiredVocabularyIdSet([vocabularyId]);
+  if (
+    !session ||
+    !Array.isArray(session.dueTargets) ||
+    !session.dueTargets.includes(vocabularyId) ||
+    !eligible.has(vocabularyId)
+  ) {
+    throw new Response("Từ này không thuộc phiên ôn FSRS hiện tại.", {
+      status: 409,
+    });
+  }
+  const completed = await prisma.reviewLog.findFirst({
+    where: {
+      vocabularyId,
+      exerciseType: "FLASHCARD",
+      correct: true,
+      reviewedAt: { gte: session.startedAt },
+    },
+    select: { id: true },
+  });
+  if (completed)
+    throw new Response("Từ này đã được ôn hôm nay.", { status: 409 });
 
   const vocabulary = await prisma.vocabulary.findUnique({
     where: {
@@ -57,6 +87,14 @@ export async function action({ request }) {
     throw new Response("Vocabulary not found", {
       status: 404,
     });
+  }
+
+  if (
+    !vocabulary.memory ||
+    vocabulary.memory.state === "NEW" ||
+    new Date(vocabulary.memory.due) > new Date()
+  ) {
+    throw new Response("Từ này chưa đến hạn ôn.", { status: 409 });
   }
 
   const next = scheduleReview(vocabulary.memory, rating, new Date());

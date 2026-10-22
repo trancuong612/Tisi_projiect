@@ -39,13 +39,17 @@ import {
   markNewWordExposed,
 } from "../services/new-learning.server";
 
-export async function loader() {
+export async function loader({ request }) {
+  const url = new URL(request.url);
+  const lane =
+    url.searchParams.get("mode") === "carryover" ? "carryover" : "new";
   const daily = await getDailyLearningQueue();
-  const learning = await getNewLearningState(daily.sessionId);
+  const learning = await getNewLearningState(daily.sessionId, lane);
 
   return json({
     sessionId: daily.sessionId,
     learning,
+    lane,
     workload: daily.workload,
   });
 }
@@ -69,7 +73,12 @@ export async function action({ request }) {
       vocabularyId,
     });
 
-    return redirect("/learn");
+    const url = new URL(request.url);
+    return redirect(
+      url.searchParams.get("mode") === "carryover"
+        ? "/learn?mode=carryover"
+        : "/learn",
+    );
   }
 
   if (intent === "answer") {
@@ -277,7 +286,7 @@ function SkillChecks({ progress }) {
   );
 }
 
-function SessionProgress({ learning }) {
+function SessionProgress({ learning, lane }) {
   const summary = learning.summary;
 
   if (!summary?.total) {
@@ -291,7 +300,9 @@ function SessionProgress({ learning }) {
       <div className="flex items-center justify-between gap-4">
         <div>
           <div className="text-xs font-black uppercase tracking-[0.12em] text-emerald-600">
-            New Word Acquisition
+            {lane === "carryover"
+              ? "Continuing Acquisition"
+              : "New Word Acquisition"}
           </div>
 
           <div className="mt-1 text-sm font-black text-slate-800">
@@ -329,7 +340,7 @@ function SessionProgress({ learning }) {
   );
 }
 
-function ResultCard({ result }) {
+function ResultCard({ result, lane }) {
   const evaluation = result.usageEvaluation;
 
   return (
@@ -432,7 +443,7 @@ function ResultCard({ result }) {
       )}
 
       <Link
-        to="/learn"
+        to={lane === "carryover" ? "/learn?mode=carryover" : "/learn"}
         className="mt-6 flex w-full items-center justify-center gap-2 rounded-2xl bg-emerald-600 px-5 py-4 font-black text-white">
         Câu tiếp theo
         <ArrowRight size={18} />
@@ -441,7 +452,7 @@ function ResultCard({ result }) {
   );
 }
 
-function ExposureCard({ learning, sessionId, submitting }) {
+function ExposureCard({ learning, sessionId, submitting, lane }) {
   const [revealed, setRevealed] = useState(false);
 
   useEffect(() => {
@@ -461,7 +472,10 @@ function ExposureCard({ learning, sessionId, submitting }) {
       <SkillChecks progress={learning.wordProgress} />
 
       {revealed ? (
-        <Form method="post" className="mt-4">
+        <Form
+          method="post"
+          action={lane === "carryover" ? "/learn?mode=carryover" : "/learn"}
+          className="mt-4">
           <input type="hidden" name="intent" value="expose" />
           <input type="hidden" name="sessionId" value={sessionId} />
           <input type="hidden" name="vocabularyId" value={learning.word.id} />
@@ -484,7 +498,7 @@ function ExposureCard({ learning, sessionId, submitting }) {
   );
 }
 
-function ExerciseCard({ learning, sessionId, submitting, usageError }) {
+function ExerciseCard({ learning, sessionId, submitting, usageError, lane }) {
   const exercise = learning.exercise;
   const word = learning.word;
   const exerciseKey = `${word.id}:${exercise.type}:${exercise.stage}:${
@@ -703,7 +717,11 @@ function ExerciseCard({ learning, sessionId, submitting, usageError }) {
       )}
 
       {choiceExercise && (
-        <Form method="post" className="mt-7" onSubmit={captureResponseTime}>
+        <Form
+          method="post"
+          action={lane === "carryover" ? "/learn?mode=carryover" : "/learn"}
+          className="mt-7"
+          onSubmit={captureResponseTime}>
           <input type="hidden" name="intent" value="answer" />
           <input type="hidden" name="sessionId" value={sessionId} />
           <input type="hidden" name="vocabularyId" value={word.id} />
@@ -729,7 +747,11 @@ function ExerciseCard({ learning, sessionId, submitting, usageError }) {
       )}
 
       {typedExercise && !spellingVisible && (
-        <Form method="post" className="mt-7" onSubmit={captureResponseTime}>
+        <Form
+          method="post"
+          action={lane === "carryover" ? "/learn?mode=carryover" : "/learn"}
+          className="mt-7"
+          onSubmit={captureResponseTime}>
           <input type="hidden" name="intent" value="answer" />
           <input type="hidden" name="sessionId" value={sessionId} />
           <input type="hidden" name="vocabularyId" value={word.id} />
@@ -789,7 +811,11 @@ function ExerciseCard({ learning, sessionId, submitting, usageError }) {
       )}
 
       {exercise.type === "USAGE" && (
-        <Form method="post" className="mt-7" onSubmit={captureResponseTime}>
+        <Form
+          method="post"
+          action={lane === "carryover" ? "/learn?mode=carryover" : "/learn"}
+          className="mt-7"
+          onSubmit={captureResponseTime}>
           <input type="hidden" name="intent" value="answer" />
           <input type="hidden" name="sessionId" value={sessionId} />
           <input type="hidden" name="vocabularyId" value={word.id} />
@@ -859,7 +885,7 @@ function ExerciseCard({ learning, sessionId, submitting, usageError }) {
 }
 
 export default function Learn() {
-  const { sessionId, learning, workload } = useLoaderData();
+  const { sessionId, learning, workload, lane } = useLoaderData();
   const actionData = useActionData();
   const navigation = useNavigation();
 
@@ -875,7 +901,9 @@ export default function Learn() {
       <main className="page-shell max-w-xl pb-28">
         <div className="mb-5">
           <p className="text-sm font-black text-emerald-700">
-            HỌC TỪ MỚI · INTENSIVE
+            {lane === "carryover"
+              ? "TIẾP TỤC TỪ HỌC DỞ"
+              : "HỌC TỪ MỚI · INTENSIVE"}
           </p>
 
           <h1 className="mt-1 text-2xl font-black text-slate-900">
@@ -890,7 +918,7 @@ export default function Learn() {
           </p>
         </div>
 
-        <SessionProgress learning={learning} />
+        <SessionProgress learning={learning} lane={lane} />
 
         {workload.mode !== "NORMAL" && (
           <div
@@ -917,12 +945,13 @@ export default function Learn() {
         )}
 
         {result ? (
-          <ResultCard result={result} />
+          <ResultCard result={result} lane={lane} />
         ) : learning.mode === "EXPOSURE" ? (
           <ExposureCard
             learning={learning}
             sessionId={sessionId}
             submitting={submitting}
+            lane={lane}
           />
         ) : learning.mode === "EXERCISE" || learning.mode === "FINAL" ? (
           <ExerciseCard
@@ -930,6 +959,7 @@ export default function Learn() {
             sessionId={sessionId}
             submitting={submitting}
             usageError={usageError}
+            lane={lane}
           />
         ) : learning.mode === "COMPLETE" ? (
           <div className="soft-card rounded-[2rem] p-8 text-center">
@@ -940,9 +970,10 @@ export default function Learn() {
             </h2>
 
             <p className="mt-3 text-sm font-semibold leading-6 text-slate-500">
-              Các từ hôm nay đã vượt cả phần học chính và Final Challenge. Từ
-              đây FSRS tiếp quản việc nhắc lại dài hạn, còn SkillState giữ lại
-              điểm yếu để Practice tiếp tục đánh đúng kỹ năng cần củng cố.
+              Các từ trong nhóm này đã vượt cả phần học chính và Final
+              Challenge. Từ đây FSRS tiếp quản việc nhắc lại dài hạn, còn
+              SkillState giữ lại điểm yếu để Practice tiếp tục đánh đúng kỹ năng
+              cần củng cố.
             </p>
 
             <div className="mt-6 grid grid-cols-2 gap-3">
@@ -977,7 +1008,9 @@ export default function Learn() {
             <div className="text-4xl">🌿</div>
 
             <h2 className="mt-3 text-xl font-black text-slate-900">
-              Hôm nay không có từ mới
+              {lane === "carryover"
+                ? "Không có từ tồn cần học"
+                : "Hôm nay không có từ mới"}
             </h2>
 
             <p className="mt-2 text-sm font-semibold leading-6 text-slate-500">

@@ -802,7 +802,65 @@ function buildProgressSummary(progress, word) {
   };
 }
 
-async function getSessionContext(sessionId) {
+/** Resume acquisition across calendar days without deleting previous session data.
+ * Copy passed checkpoints into today's progress row only if no row exists.
+ * Per-session cooldown turns are reset, while learned skills are preserved. */
+async function inheritUnfinishedProgress(sessionId, ids) {
+  if (!ids.length) return;
+  const current = await prisma.newLearningProgress.findMany({
+    where: { sessionId, vocabularyId: { in: ids } },
+    select: { vocabularyId: true },
+  });
+  const currentIds = new Set(current.map((row) => row.vocabularyId));
+  const missing = ids.filter((id) => !currentIds.has(id));
+  if (!missing.length) return;
+  const older = await prisma.newLearningProgress.findMany({
+    where: { vocabularyId: { in: missing }, sessionId: { not: sessionId } },
+    orderBy: { updatedAt: "desc" },
+  });
+  const newest = new Map();
+  for (const row of older) {
+    if (!newest.has(row.vocabularyId)) newest.set(row.vocabularyId, row);
+  }
+  const passFields = [
+    "recognitionPass",
+    "recallPass",
+    "spellingPass",
+    "listeningPass",
+    "dictationPass",
+    "contextPass",
+    "collocationPass",
+    "confusionPass",
+    "usagePass",
+  ];
+  for (const [vocabularyId, old] of newest) {
+    // An old session may have finished on another tab after today's snapshot.
+    // Mirror that completion instead of restarting an already mastered word.
+    const flags = Object.fromEntries(
+      passFields.map((field) => [field, !!old[field]]),
+    );
+    await prisma.newLearningProgress.upsert({
+      where: { sessionId_vocabularyId: { sessionId, vocabularyId } },
+      create: {
+        sessionId,
+        vocabularyId,
+        exposed: old.exposed,
+        ...flags,
+        finalPass: !!(old.finalPass && old.masteredAt),
+        masteredAt: old.finalPass && old.masteredAt ? old.masteredAt : null,
+        // Encounter counters belong to the new session; no artificial cooldown.
+        encounterCount: 0,
+        correctCount: old.correctCount,
+        wrongCount: old.wrongCount,
+        nextEligibleTurn: 0,
+        lastTurn: -1,
+      },
+      update: {},
+    });
+  }
+}
+
+async function getSessionContext(sessionId, lane = "new") {
   const session = await prisma.dailySession.findUnique({
     where: {
       id: sessionId,
@@ -810,6 +868,7 @@ async function getSessionContext(sessionId) {
     select: {
       id: true,
       newTargets: true,
+      workloadMeta: true,
       startedAt: true,
     },
   });
@@ -820,7 +879,12 @@ async function getSessionContext(sessionId) {
     });
   }
 
-  const newIds = toArray(session.newTargets);
+  const newIds =
+    lane === "carryover"
+      ? toArray(session.workloadMeta?.carryoverTargets)
+      : toArray(session.newTargets);
+
+  await inheritUnfinishedProgress(sessionId, newIds);
 
   if (!newIds.length) {
     return {
@@ -909,8 +973,8 @@ function calculateSessionPercent(words, progressMap) {
   return total ? Math.round((passed / total) * 100) : 100;
 }
 
-export async function getNewLearningState(sessionId) {
-  const context = await getSessionContext(sessionId);
+export async function getNewLearningState(sessionId, lane = "new") {
+  const context = await getSessionContext(sessionId, lane);
 
   if (!context.newIds.length) {
     return {
@@ -1119,6 +1183,7 @@ export async function markNewWordExposed({ sessionId, vocabularyId }) {
     },
     select: {
       newTargets: true,
+      workloadMeta: true,
     },
   });
 
@@ -1128,7 +1193,12 @@ export async function markNewWordExposed({ sessionId, vocabularyId }) {
     });
   }
 
-  const newIds = toArray(session.newTargets);
+  const newIds = [
+    ...new Set([
+      ...toArray(session.newTargets),
+      ...toArray(session.workloadMeta?.carryoverTargets),
+    ]),
+  ];
 
   if (!newIds.includes(vocabularyId)) {
     throw new Response("Vocabulary is not part of today's new-word session.", {
@@ -1136,6 +1206,7 @@ export async function markNewWordExposed({ sessionId, vocabularyId }) {
     });
   }
 
+  await inheritUnfinishedProgress(sessionId, [vocabularyId]);
   await prisma.newLearningProgress.upsert({
     where: {
       sessionId_vocabularyId: {
@@ -1167,6 +1238,7 @@ async function validateSessionWord({ sessionId, vocabularyId }) {
     },
     select: {
       newTargets: true,
+      workloadMeta: true,
     },
   });
 
@@ -1176,13 +1248,18 @@ async function validateSessionWord({ sessionId, vocabularyId }) {
     });
   }
 
-  const newIds = toArray(session.newTargets);
-
+  const newIds = [
+    ...new Set([
+      ...toArray(session.newTargets),
+      ...toArray(session.workloadMeta?.carryoverTargets),
+    ]),
+  ];
   if (!newIds.includes(vocabularyId)) {
     throw new Response("Vocabulary is not part of today's new-word session.", {
       status: 400,
     });
   }
+  await inheritUnfinishedProgress(sessionId, [vocabularyId]);
 }
 
 async function getWordForLearning(vocabularyId) {
